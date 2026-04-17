@@ -19,6 +19,7 @@ export interface AuthForgeClientOptions {
 }
 
 export declare function deriveSigningKey(appSecret: string, nonce: string): Buffer;
+export declare function deriveHeartbeatSigningKey(sigKey: string, nonce: string): Buffer;
 export declare function signPayload(payloadBase64: string, key: Buffer): string;
 
 export declare class AuthForgeClient {

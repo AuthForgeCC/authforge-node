@@ -19,6 +19,7 @@ const KNOWN_SERVER_ERRORS = new Set([
   "app_disabled",
   "session_expired",
   "bad_request",
+  "server_error",
   "checksum_required",
   "checksum_mismatch",
 ]);
@@ -40,6 +41,10 @@ function cloneObject(value) {
 
 export function deriveSigningKey(appSecret, nonce) {
   return createHash("sha256").update(`${appSecret}${nonce}`, "utf8").digest();
+}
+
+export function deriveHeartbeatSigningKey(sigKey, nonce) {
+  return createHash("sha256").update(`${sigKey}${nonce}`, "utf8").digest();
 }
 
 export function signPayload(payloadBase64, key) {
@@ -138,6 +143,7 @@ export class AuthForgeClient {
     this._rawPayloadB64 = null;
     this._signature = null;
     this._derivedKey = null;
+    this._sigKey = null;
     this._sessionData = null;
     this._appVariables = null;
     this._licenseVariables = null;
@@ -173,6 +179,7 @@ export class AuthForgeClient {
     this._rawPayloadB64 = null;
     this._signature = null;
     this._derivedKey = null;
+    this._sigKey = null;
     this._sessionData = null;
     this._appVariables = null;
     this._licenseVariables = null;
@@ -237,7 +244,7 @@ export class AuthForgeClient {
     };
     const responseObject = await this._postJson("/auth/heartbeat", body);
     const expectedNonce = String(body.nonce ?? "").trim();
-    this._applySignedResponse(responseObject, expectedNonce, null);
+    this._applySignedResponse(responseObject, expectedNonce, null, "heartbeat");
   }
 
   _localHeartbeat() {
@@ -271,10 +278,10 @@ export class AuthForgeClient {
     };
     const responseObject = await this._postJson("/auth/validate", body);
     const expectedNonce = String(body.nonce ?? "").trim();
-    this._applySignedResponse(responseObject, expectedNonce, licenseKey);
+    this._applySignedResponse(responseObject, expectedNonce, licenseKey, "validate");
   }
 
-  _applySignedResponse(responseObject, expectedNonce, licenseKey) {
+  _applySignedResponse(responseObject, expectedNonce, licenseKey, context = "validate") {
     if (!this._isSuccessStatus(responseObject?.status)) {
       throw new Error(this._extractServerError(responseObject));
     }
@@ -288,12 +295,24 @@ export class AuthForgeClient {
       throw new Error("nonce_mismatch");
     }
 
-    const derivedKey = this._deriveKey(expectedNonce);
+    let derivedKey;
+    if (context === "validate") {
+      derivedKey = this._deriveValidateKey(expectedNonce);
+    } else if (context === "heartbeat") {
+      derivedKey = this._deriveHeartbeatKey(expectedNonce);
+    } else {
+      throw new Error(`unknown_signing_context:${context}`);
+    }
     this._verifySignature(rawPayloadB64, derivedKey, signature);
 
     const sessionToken = String(payloadObject.sessionToken ?? "").trim();
     if (!sessionToken) {
       throw new Error("missing_sessionToken");
+    }
+
+    const newSigKey = this._extractSigKeyFromSessionToken(sessionToken);
+    if (!newSigKey) {
+      throw new Error("missing_sigKey");
     }
 
     const expiresFromToken = this._extractExpiresInFromSessionToken(sessionToken);
@@ -316,6 +335,7 @@ export class AuthForgeClient {
     this._rawPayloadB64 = rawPayloadB64;
     this._signature = signature;
     this._derivedKey = derivedKey;
+    this._sigKey = newSigKey;
     this._sessionData = { ...payloadObject };
     this._appVariables = this._extractOptionalMap(payloadObject.appVariables);
     this._licenseVariables = this._extractOptionalMap(payloadObject.licenseVariables);
@@ -334,6 +354,7 @@ export class AuthForgeClient {
 
       let networkAttempt = 0;
       let parsedResponse = null;
+      let lastStatusCode = 0;
 
       while (true) {
         let statusCode = 0;
@@ -350,11 +371,12 @@ export class AuthForgeClient {
           throw new Error(`url_error: ${error}`);
         }
 
+        lastStatusCode = statusCode;
         if (statusCode >= 400) {
           try {
             parsedResponse = this._parseResponseObject(raw);
           } catch {
-            throw new Error(`http_error_${statusCode}: ${raw || "unknown_http_error"}`);
+            throw new Error(`http_error_${statusCode}`);
           }
         } else {
           parsedResponse = this._parseResponseObject(raw);
@@ -367,10 +389,10 @@ export class AuthForgeClient {
         break;
       }
 
-      if (
-        this._extractServerError(parsedResponse) === "rate_limited" &&
-        rateAttempt < RATE_LIMIT_RETRY_DELAYS.length
-      ) {
+      const isRateLimited =
+        lastStatusCode === 429 ||
+        this._extractServerError(parsedResponse) === "rate_limited";
+      if (isRateLimited && rateAttempt < RATE_LIMIT_RETRY_DELAYS.length) {
         await sleepSeconds(RATE_LIMIT_RETRY_DELAYS[rateAttempt]);
         rateAttempt += 1;
         continue;
@@ -464,24 +486,39 @@ export class AuthForgeClient {
     }
   }
 
-  _extractExpiresInFromSessionToken(sessionToken) {
+  _decodeSessionTokenBody(sessionToken) {
     const parts = String(sessionToken).split(".");
     if (parts.length < 2) {
       return null;
     }
-
     const payloadPart = this._addBase64Padding(parts[0]).replace(/-/g, "+").replace(/_/g, "/");
     try {
       const decoded = Buffer.from(payloadPart, "base64").toString("utf8");
       const payload = JSON.parse(decoded);
-      if (!payload || payload.expiresIn === undefined || payload.expiresIn === null) {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         return null;
       }
-      const value = Number.parseInt(String(payload.expiresIn), 10);
-      return Number.isNaN(value) ? null : value;
+      return payload;
     } catch {
       return null;
     }
+  }
+
+  _extractExpiresInFromSessionToken(sessionToken) {
+    const payload = this._decodeSessionTokenBody(sessionToken);
+    if (!payload || payload.expiresIn === undefined || payload.expiresIn === null) {
+      return null;
+    }
+    const value = Number.parseInt(String(payload.expiresIn), 10);
+    return Number.isNaN(value) ? null : value;
+  }
+
+  _extractSigKeyFromSessionToken(sessionToken) {
+    const payload = this._decodeSessionTokenBody(sessionToken);
+    if (!payload || typeof payload.sigKey !== "string" || !payload.sigKey) {
+      return null;
+    }
+    return payload.sigKey;
   }
 
   _addBase64Padding(text) {
@@ -492,8 +529,15 @@ export class AuthForgeClient {
     return `${text}${"=".repeat(4 - remainder)}`;
   }
 
-  _deriveKey(nonce) {
+  _deriveValidateKey(nonce) {
     return deriveSigningKey(this.appSecret, nonce);
+  }
+
+  _deriveHeartbeatKey(nonce) {
+    if (!this._sigKey) {
+      throw new Error("missing_sig_key");
+    }
+    return deriveHeartbeatSigningKey(this._sigKey, nonce);
   }
 
   _verifySignature(rawPayloadB64, derivedKey, signature) {
