@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import https from "node:https";
 import os from "node:os";
 import { clearInterval as clearIntervalTimer, setInterval as setIntervalTimer } from "node:timers";
@@ -13,6 +13,7 @@ const KNOWN_SERVER_ERRORS = new Set([
   "revoked",
   "hwid_mismatch",
   "no_credits",
+  "app_burn_cap_reached",
   "blocked",
   "rate_limited",
   "replay_detected",
@@ -20,8 +21,6 @@ const KNOWN_SERVER_ERRORS = new Set([
   "session_expired",
   "bad_request",
   "server_error",
-  "checksum_required",
-  "checksum_mismatch",
 ]);
 
 const SUCCESS_STATUSES = new Set(["ok", "success", "valid", "true", "1"]);
@@ -39,16 +38,29 @@ function cloneObject(value) {
   return null;
 }
 
-export function deriveSigningKey(appSecret, nonce) {
-  return createHash("sha256").update(`${appSecret}${nonce}`, "utf8").digest();
+function toBase64Url(rawBase64) {
+  return rawBase64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-export function deriveHeartbeatSigningKey(sigKey, nonce) {
-  return createHash("sha256").update(`${sigKey}${nonce}`, "utf8").digest();
+function createEd25519PublicKey(rawBase64) {
+  return createPublicKey({
+    key: {
+      crv: "Ed25519",
+      kty: "OKP",
+      x: toBase64Url(rawBase64),
+    },
+    format: "jwk",
+  });
 }
 
-export function signPayload(payloadBase64, key) {
-  return createHmac("sha256", key).update(payloadBase64, "utf8").digest("hex");
+export function verifyPayloadSignatureEd25519(payloadBase64, signatureBase64, publicKeyBase64) {
+  const isValid = verify(
+    null,
+    Buffer.from(payloadBase64, "utf8"),
+    createEd25519PublicKey(publicKeyBase64),
+    Buffer.from(signatureBase64, "base64"),
+  );
+  return isValid;
 }
 
 function postJson(urlText, body, timeoutSeconds) {
@@ -94,6 +106,7 @@ export class AuthForgeClient {
   constructor(
     appId,
     appSecret,
+    publicKey,
     heartbeatMode,
     heartbeatInterval = 900,
     apiBaseUrl = DEFAULT_API_BASE_URL,
@@ -104,6 +117,7 @@ export class AuthForgeClient {
       const options = appId;
       appId = options.appId;
       appSecret = options.appSecret;
+      publicKey = options.publicKey;
       heartbeatMode = options.heartbeatMode;
       heartbeatInterval = options.heartbeatInterval ?? 900;
       apiBaseUrl = options.apiBaseUrl ?? DEFAULT_API_BASE_URL;
@@ -117,6 +131,9 @@ export class AuthForgeClient {
     if (!appSecret || typeof appSecret !== "string") {
       throw new Error("appSecret must be a non-empty string");
     }
+    if (!publicKey || typeof publicKey !== "string") {
+      throw new Error("publicKey must be a non-empty string");
+    }
     const mode = String(heartbeatMode ?? "").toUpperCase();
     if (mode !== "LOCAL" && mode !== "SERVER") {
       throw new Error("heartbeatMode must be LOCAL or SERVER");
@@ -127,6 +144,7 @@ export class AuthForgeClient {
 
     this.appId = appId;
     this.appSecret = appSecret;
+    this.publicKey = publicKey;
     this.heartbeatMode = mode;
     this.heartbeatInterval = Number.parseInt(String(heartbeatInterval), 10);
     this.apiBaseUrl = String(apiBaseUrl).replace(/\/+$/, "");
@@ -142,8 +160,7 @@ export class AuthForgeClient {
     this._lastNonce = null;
     this._rawPayloadB64 = null;
     this._signature = null;
-    this._derivedKey = null;
-    this._sigKey = null;
+    this._keyId = null;
     this._sessionData = null;
     this._appVariables = null;
     this._licenseVariables = null;
@@ -178,8 +195,7 @@ export class AuthForgeClient {
     this._lastNonce = null;
     this._rawPayloadB64 = null;
     this._signature = null;
-    this._derivedKey = null;
-    this._sigKey = null;
+    this._keyId = null;
     this._sessionData = null;
     this._appVariables = null;
     this._licenseVariables = null;
@@ -250,14 +266,13 @@ export class AuthForgeClient {
   _localHeartbeat() {
     const rawPayloadB64 = this._rawPayloadB64;
     const signature = this._signature;
-    const derivedKey = this._derivedKey;
     const expiresIn = this._sessionExpiresIn;
 
-    if (!rawPayloadB64 || !signature || !derivedKey) {
+    if (!rawPayloadB64 || !signature) {
       throw new Error("missing_local_verification_state");
     }
 
-    this._verifySignature(rawPayloadB64, derivedKey, signature);
+    this._verifySignature(rawPayloadB64, signature);
     if (expiresIn === null) {
       throw new Error("missing_session_expiry");
     }
@@ -295,24 +310,11 @@ export class AuthForgeClient {
       throw new Error("nonce_mismatch");
     }
 
-    let derivedKey;
-    if (context === "validate") {
-      derivedKey = this._deriveValidateKey(expectedNonce);
-    } else if (context === "heartbeat") {
-      derivedKey = this._deriveHeartbeatKey(expectedNonce);
-    } else {
-      throw new Error(`unknown_signing_context:${context}`);
-    }
-    this._verifySignature(rawPayloadB64, derivedKey, signature);
+    this._verifySignature(rawPayloadB64, signature);
 
     const sessionToken = String(payloadObject.sessionToken ?? "").trim();
     if (!sessionToken) {
       throw new Error("missing_sessionToken");
-    }
-
-    const newSigKey = this._extractSigKeyFromSessionToken(sessionToken);
-    if (!newSigKey) {
-      throw new Error("missing_sigKey");
     }
 
     const expiresFromToken = this._extractExpiresInFromSessionToken(sessionToken);
@@ -334,8 +336,7 @@ export class AuthForgeClient {
     this._lastNonce = expectedNonce;
     this._rawPayloadB64 = rawPayloadB64;
     this._signature = signature;
-    this._derivedKey = derivedKey;
-    this._sigKey = newSigKey;
+    this._keyId = typeof responseObject?.keyId === "string" ? responseObject.keyId : null;
     this._sessionData = { ...payloadObject };
     this._appVariables = this._extractOptionalMap(payloadObject.appVariables);
     this._licenseVariables = this._extractOptionalMap(payloadObject.licenseVariables);
@@ -506,19 +507,11 @@ export class AuthForgeClient {
 
   _extractExpiresInFromSessionToken(sessionToken) {
     const payload = this._decodeSessionTokenBody(sessionToken);
-    if (!payload || payload.expiresIn === undefined || payload.expiresIn === null) {
+    if (!payload || payload.exp === undefined || payload.exp === null) {
       return null;
     }
-    const value = Number.parseInt(String(payload.expiresIn), 10);
+    const value = Number.parseInt(String(payload.exp), 10);
     return Number.isNaN(value) ? null : value;
-  }
-
-  _extractSigKeyFromSessionToken(sessionToken) {
-    const payload = this._decodeSessionTokenBody(sessionToken);
-    if (!payload || typeof payload.sigKey !== "string" || !payload.sigKey) {
-      return null;
-    }
-    return payload.sigKey;
   }
 
   _addBase64Padding(text) {
@@ -529,26 +522,14 @@ export class AuthForgeClient {
     return `${text}${"=".repeat(4 - remainder)}`;
   }
 
-  _deriveValidateKey(nonce) {
-    return deriveSigningKey(this.appSecret, nonce);
-  }
-
-  _deriveHeartbeatKey(nonce) {
-    if (!this._sigKey) {
-      throw new Error("missing_sig_key");
-    }
-    return deriveHeartbeatSigningKey(this._sigKey, nonce);
-  }
-
-  _verifySignature(rawPayloadB64, derivedKey, signature) {
-    const expected = signPayload(rawPayloadB64, derivedKey);
-    const received = String(signature).trim().toLowerCase();
-    const expectedBuffer = Buffer.from(expected, "utf8");
-    const receivedBuffer = Buffer.from(received, "utf8");
-    if (
-      expectedBuffer.length !== receivedBuffer.length ||
-      !timingSafeEqual(expectedBuffer, receivedBuffer)
-    ) {
+  _verifySignature(rawPayloadB64, signature) {
+    const isValid = verify(
+      null,
+      Buffer.from(rawPayloadB64, "utf8"),
+      createEd25519PublicKey(this.publicKey),
+      Buffer.from(String(signature).trim(), "base64"),
+    );
+    if (!isValid) {
       throw new Error("signature_mismatch");
     }
   }

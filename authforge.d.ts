@@ -11,6 +11,7 @@ export interface VariableMap {
 export interface AuthForgeClientOptions {
   appId: string;
   appSecret: string;
+  publicKey: string;
   heartbeatMode: string;
   heartbeatInterval?: number;
   apiBaseUrl?: string;
@@ -18,15 +19,18 @@ export interface AuthForgeClientOptions {
   requestTimeout?: number;
 }
 
-export declare function deriveSigningKey(appSecret: string, nonce: string): Buffer;
-export declare function deriveHeartbeatSigningKey(sigKey: string, nonce: string): Buffer;
-export declare function signPayload(payloadBase64: string, key: Buffer): string;
+export declare function verifyPayloadSignatureEd25519(
+  payloadBase64: string,
+  signatureBase64: string,
+  publicKeyBase64: string,
+): boolean;
 
 export declare class AuthForgeClient {
   constructor(options: AuthForgeClientOptions);
   constructor(
     appId: string,
     appSecret: string,
+    publicKey: string,
     heartbeatMode: string,
     heartbeatInterval?: number,
     apiBaseUrl?: string,
@@ -36,6 +40,7 @@ export declare class AuthForgeClient {
 
   readonly appId: string;
   readonly appSecret: string;
+  readonly publicKey: string;
   readonly heartbeatMode: HeartbeatMode;
   readonly heartbeatInterval: number;
   readonly apiBaseUrl: string;

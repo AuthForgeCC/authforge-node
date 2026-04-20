@@ -1,6 +1,6 @@
 # AuthForge Node.js SDK
 
-Official Node.js SDK for [AuthForge](https://authforge.cc) - credit-based license key authentication with HMAC-verified heartbeats.
+Official Node.js SDK for [AuthForge](https://authforge.cc) - credit-based license key authentication with Ed25519-verified responses.
 
 **Zero dependencies.** Node.js built-ins only. Works on Node.js 18+.
 
@@ -20,6 +20,7 @@ import { AuthForgeClient } from "authforge";
 const client = new AuthForgeClient(
   "YOUR_APP_ID", // from your AuthForge dashboard
   "YOUR_APP_SECRET", // from your AuthForge dashboard
+  "YOUR_PUBLIC_KEY", // from your AuthForge dashboard
   "SERVER", // "SERVER" or "LOCAL"
 );
 
@@ -42,6 +43,7 @@ You can also copy `authforge.mjs` directly into your project if you prefer a sin
 | --- | --- | --- | --- |
 | `appId` | `string` | required | Your application ID from the AuthForge dashboard |
 | `appSecret` | `string` | required | Your application secret from the AuthForge dashboard |
+| `publicKey` | `string` | required | App Ed25519 public key (base64) from dashboard |
 | `heartbeatMode` | `string` | required | `"SERVER"` or `"LOCAL"` (see below) |
 | `heartbeatInterval` | `number` | `900` | Seconds between heartbeat checks (default 15 min) |
 | `apiBaseUrl` | `string` | `https://auth.authforge.cc` | API endpoint |
@@ -70,7 +72,7 @@ You can also copy `authforge.mjs` directly into your project if you prefer a sin
 If authentication fails (login rejected, heartbeat fails, signature mismatch, etc.), the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `process.exit(1)` to terminate the process.** This prevents your app from running without a valid license.
 
 Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`, `checksum_required`, `checksum_mismatch`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`
 
 Request retries are automatic inside the internal HTTP layer:
 
@@ -91,6 +93,7 @@ const handleAuthFailure = (reason, error) => {
 const client = new AuthForgeClient(
   "YOUR_APP_ID",
   "YOUR_APP_SECRET",
+  "YOUR_PUBLIC_KEY",
   "SERVER",
   900,
   "https://auth.authforge.cc",
@@ -100,11 +103,11 @@ const client = new AuthForgeClient(
 
 ## How It Works
 
-1. **Login** - Collects a hardware fingerprint (MAC, CPU, hostname), generates a random nonce, and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the HMAC-SHA256 signature and nonce to prevent replay attacks.
+1. **Login** - Collects a hardware fingerprint (MAC, CPU, hostname), generates a random nonce, and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
 
 2. **Heartbeat** - A background interval checks in at the configured cadence. In SERVER mode, it sends a fresh nonce and verifies the response. In LOCAL mode, it re-verifies the stored signature and checks expiry without network calls.
 
-3. **Crypto** - The `/validate` response is signed with a key derived from `SHA256(appSecret + nonce)`. That response carries a per-session `sigKey` (32-byte random hex) embedded in the signed session token. Every `/heartbeat` response is then signed with a key derived from `SHA256(sigKey + nonce)`. This keeps `appSecret` out of the heartbeat path while still rotating the signing key on every nonce, making replay and MITM attacks impractical.
+3. **Crypto** - Both `/validate` and `/heartbeat` responses are signed by AuthForge with your app's Ed25519 private key. The SDK verifies every signed `payload` using your configured `publicKey` and rejects tampered responses.
 
 ## Hardware ID
 
@@ -121,7 +124,7 @@ Each component falls back to `unavailable` if it cannot be read.
 
 ## Test Vectors
 
-The `generate_vectors.mjs` script and `test_vectors.json` file are provided for cross-SDK verification. If you are porting this SDK to another language, your implementation must produce identical `derivedKeyHex` and `signatureHex` values for the same inputs.
+The shared `test_vectors.json` file validates cross-language Ed25519 verification behavior.
 
 ## Requirements
 
