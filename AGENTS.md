@@ -15,10 +15,10 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 ## Installation
 
-Install from npm:
+Install from npm as **`@authforgecc/sdk`**:
 
 ```bash
-npm install authforge
+npm install @authforgecc/sdk
 ```
 
 Or copy `authforge.mjs` into your project (single file, Node.js built-ins only). Requires Node.js 18+.
@@ -27,7 +27,7 @@ Or copy `authforge.mjs` into your project (single file, Node.js built-ins only).
 
 ```js
 import process from "node:process";
-import { AuthForgeClient } from "authforge";
+import { AuthForgeClient } from "@authforgecc/sdk";
 
 const onFailure = (reason, error) => {
   console.error(`AuthForge: ${reason}`);
@@ -40,6 +40,7 @@ const onFailure = (reason, error) => {
 const client = new AuthForgeClient(
   "YOUR_APP_ID",
   "YOUR_APP_SECRET",
+  "YOUR_PUBLIC_KEY",
   "SERVER",
   900,
   "https://auth.authforge.cc",

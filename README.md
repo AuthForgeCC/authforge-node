@@ -6,16 +6,16 @@ Official Node.js SDK for [AuthForge](https://authforge.cc) - credit-based licens
 
 ## Quick Start
 
-Install:
+Install from npm:
 
 ```bash
-npm install authforge
+npm install @authforgecc/sdk
 ```
 
 Then:
 
 ```js
-import { AuthForgeClient } from "authforge";
+import { AuthForgeClient } from "@authforgecc/sdk";
 
 const client = new AuthForgeClient(
   "YOUR_APP_ID", // from your AuthForge dashboard
