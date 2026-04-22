@@ -7,6 +7,12 @@
 
 AuthForge is a license key validation service. Your app sends a license key + hardware ID to the AuthForge API, gets back a cryptographically signed response, and runs background heartbeats to maintain the session. If the license is revoked or expired, the heartbeat fails and you handle it (typically exit the app).
 
+## Billing model (so you can pick sensible intervals)
+
+- **1 `login()` = 1 credit** (one `/auth/validate` debit).
+- **10 heartbeats = 1 credit** (billed on every 10th successful heartbeat per license).
+- Any `heartbeatInterval` is safe — from `1` (server apps) to `900` (15 min, desktop apps). Revocations take effect on the **next** heartbeat regardless of interval.
+
 ## Installation
 
 Install from npm:
@@ -67,10 +73,11 @@ client.logout();
 | `appId` | `string` | yes | - | Application ID |
 | `appSecret` | `string` | yes | - | Application secret |
 | `heartbeatMode` | `string` | yes | - | `"SERVER"` or `"LOCAL"` (case-insensitive) |
-| `heartbeatInterval` | `number` | no | `900` | Seconds between heartbeats |
+| `heartbeatInterval` | `number` | no | `900` | Seconds between heartbeats (any value ≥ 1) |
 | `apiBaseUrl` | `string` | no | `https://auth.authforge.cc` | API base URL |
 | `onFailure` | `(reason: string, error: Error \| null) => void \| null` | no | `null` | Called on login/heartbeat/network failure; if omitted, process exits via `process.exit(1)` |
 | `requestTimeout` | `number` | no | `15` | HTTP timeout (seconds) |
+| `ttlSeconds` | `number \| null` | no | `null` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]` and preserves the lifetime across heartbeat refreshes. |
 
 ## Methods
 
@@ -86,6 +93,9 @@ client.logout();
 ## Error codes the server can return
 
 invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, blocked, rate_limited, replay_detected, session_expired, app_disabled, bad_request
+
+Notes:
+- `rate_limited` and `replay_detected` can only be returned from `/auth/validate`. Heartbeats are not IP rate-limited and do not enforce nonce replay.
 
 ## Common patterns
 

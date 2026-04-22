@@ -17,6 +17,12 @@ export interface AuthForgeClientOptions {
   apiBaseUrl?: string;
   onFailure?: ((reason: string, error: Error | null) => void) | null;
   requestTimeout?: number;
+  /**
+   * Requested session token lifetime in seconds. Server clamps to
+   * [3600, 604800]; out-of-range values are silently clamped.
+   * Omitted/null → server default (24h). Heartbeats preserve this TTL.
+   */
+  ttlSeconds?: number | null;
 }
 
 export declare function verifyPayloadSignatureEd25519(
@@ -36,6 +42,7 @@ export declare class AuthForgeClient {
     apiBaseUrl?: string,
     onFailure?: ((reason: string, error: Error | null) => void) | null,
     requestTimeout?: number,
+    ttlSeconds?: number | null,
   );
 
   readonly appId: string;
@@ -46,6 +53,7 @@ export declare class AuthForgeClient {
   readonly apiBaseUrl: string;
   readonly onFailure: ((reason: string, error: Error | null) => void) | null;
   readonly requestTimeout: number;
+  readonly ttlSeconds: number | null;
 
   login(licenseKey: string): Promise<boolean>;
   logout(): void;

@@ -45,10 +45,18 @@ You can also copy `authforge.mjs` directly into your project if you prefer a sin
 | `appSecret` | `string` | required | Your application secret from the AuthForge dashboard |
 | `publicKey` | `string` | required | App Ed25519 public key (base64) from dashboard |
 | `heartbeatMode` | `string` | required | `"SERVER"` or `"LOCAL"` (see below) |
-| `heartbeatInterval` | `number` | `900` | Seconds between heartbeat checks (default 15 min) |
+| `heartbeatInterval` | `number` | `900` | Seconds between heartbeat checks (any value ≥ 1; default 15 min) |
 | `apiBaseUrl` | `string` | `https://auth.authforge.cc` | API endpoint |
 | `onFailure` | `function` | `null` | Callback `(reason: string, error: Error \| null)` on auth failure |
 | `requestTimeout` | `number` | `15` | HTTP request timeout in seconds |
+| `ttlSeconds` | `number \| null` | `null` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
+
+## Billing
+
+- **1 `login()` call = 1 credit** (one `/auth/validate` debit).
+- **10 heartbeats on the same license = 1 credit** (billed every 10th successful heartbeat).
+
+A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A server app running 24/7 at a 1-minute interval burns ~145 credits/day — pick the interval based on how fast you need revocations to propagate (they always take effect on the **next** heartbeat).
 
 ## Methods
 
