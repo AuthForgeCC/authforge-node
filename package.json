@@ -1,7 +1,7 @@
-{
+﻿{
   "name": "@authforgecc/sdk",
-  "version": "1.0.1",
-  "description": "Official AuthForge SDK for Node.js — credit-based license key authentication with Ed25519-verified responses",
+  "version": "1.0.2",
+  "description": "Official AuthForge SDK for Node.js â€” credit-based license key authentication with Ed25519-verified responses",
   "type": "module",
   "main": "authforge.mjs",
   "types": "authforge.d.ts",
