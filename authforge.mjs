@@ -19,6 +19,7 @@ const KNOWN_SERVER_ERRORS = new Set([
   "replay_detected",
   "app_disabled",
   "session_expired",
+  "revoke_requires_session",
   "bad_request",
   "system_error",
 ]);
@@ -113,6 +114,7 @@ export class AuthForgeClient {
     onFailure = null,
     requestTimeout = 15,
     ttlSeconds = null,
+    hwidOverride = null,
   ) {
     if (appId && typeof appId === "object" && !Array.isArray(appId)) {
       const options = appId;
@@ -125,6 +127,7 @@ export class AuthForgeClient {
       onFailure = options.onFailure ?? null;
       requestTimeout = options.requestTimeout ?? 15;
       ttlSeconds = options.ttlSeconds ?? null;
+      hwidOverride = options.hwidOverride ?? null;
     }
 
     if (!appId || typeof appId !== "string") {
@@ -152,8 +155,6 @@ export class AuthForgeClient {
     this.apiBaseUrl = String(apiBaseUrl).replace(/\/+$/, "");
     this.onFailure = typeof onFailure === "function" ? onFailure : null;
     this.requestTimeout = requestTimeout;
-    // Null/undefined/<=0 means "let the server pick its default (24h)".
-    // Server clamps to [3600, 604800]; we don't duplicate the clamp here.
     const parsedTtl = Number.parseInt(String(ttlSeconds ?? ""), 10);
     this.ttlSeconds = Number.isFinite(parsedTtl) && parsedTtl > 0 ? parsedTtl : null;
 
@@ -171,7 +172,7 @@ export class AuthForgeClient {
     this._appVariables = null;
     this._licenseVariables = null;
     this._authenticated = false;
-    this._hwid = this._getHwid();
+    this._hwid = this._resolveHwid(hwidOverride);
   }
 
   async login(licenseKey) {
@@ -186,6 +187,61 @@ export class AuthForgeClient {
       this._fail("login_failed", error);
       return false;
     }
+  }
+
+  async selfBan(options = {}) {
+    if (options !== null && typeof options !== "object") {
+      throw new Error("options must be an object");
+    }
+    const opts = options ?? {};
+    const blacklistHwid = opts.blacklistHwid !== false;
+    const blacklistIp = opts.blacklistIp !== false;
+    const requestedRevoke = opts.revokeLicense !== false;
+    const sessionTokenOption =
+      typeof opts.sessionToken === "string" && opts.sessionToken.trim()
+        ? opts.sessionToken.trim()
+        : null;
+    const sessionToken = sessionTokenOption || this._sessionToken;
+
+    if (sessionToken) {
+      const body = {
+        appId: this.appId,
+        sessionToken,
+        hwid: this._hwid,
+        revokeLicense: requestedRevoke,
+        blacklistHwid,
+        blacklistIp,
+      };
+      const responseObject = await this._postJson("/auth/selfban", body);
+      if (!this._isSuccessStatus(responseObject?.status)) {
+        throw new Error(this._extractServerError(responseObject));
+      }
+      return responseObject;
+    }
+
+    const licenseKeyOption =
+      typeof opts.licenseKey === "string" && opts.licenseKey.trim()
+        ? opts.licenseKey.trim()
+        : null;
+    const licenseKey = licenseKeyOption || this._licenseKey;
+    if (!licenseKey) {
+      throw new Error("missing_license_key");
+    }
+    const body = {
+      appId: this.appId,
+      appSecret: this.appSecret,
+      licenseKey,
+      hwid: this._hwid,
+      nonce: this._generateNonce(),
+      revokeLicense: false,
+      blacklistHwid,
+      blacklistIp,
+    };
+    const responseObject = await this._postJson("/auth/selfban", body);
+    if (!this._isSuccessStatus(responseObject?.status)) {
+      throw new Error(this._extractServerError(responseObject));
+    }
+    return responseObject;
   }
 
   logout() {
@@ -430,6 +486,16 @@ export class AuthForgeClient {
     const host = this._safeHostname();
     const material = `mac:${mac}|cpu:${cpu}|host:${host}`;
     return createHash("sha256").update(material, "utf8").digest("hex");
+  }
+
+  _resolveHwid(hwidOverride) {
+    if (typeof hwidOverride === "string") {
+      const trimmed = hwidOverride.trim();
+      if (trimmed) {
+        return trimmed;
+      }
+    }
+    return this._getHwid();
   }
 
   _safeMacAddress() {

@@ -50,6 +50,19 @@ You can also copy `authforge.mjs` directly into your project if you prefer a sin
 | `onFailure` | `function` | `null` | Callback `(reason: string, error: Error \| null)` on auth failure |
 | `requestTimeout` | `number` | `15` | HTTP request timeout in seconds |
 | `ttlSeconds` | `number \| null` | `null` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
+| `hwidOverride` | `string \| null` | `null` | Optional custom hardware/subject identifier. When set to a non-empty value, the SDK uses it instead of machine fingerprinting. |
+
+### Identity-based binding example (Telegram/Discord)
+
+```js
+const client = new AuthForgeClient({
+  appId: "YOUR_APP_ID",
+  appSecret: "YOUR_APP_SECRET",
+  publicKey: "YOUR_PUBLIC_KEY",
+  heartbeatMode: "SERVER",
+  hwidOverride: `tg:${telegramUserId}`, // or `discord:${discordUserId}`
+});
+```
 
 ## Billing
 
@@ -63,6 +76,7 @@ A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A
 | Method | Returns | Description |
 | --- | --- | --- |
 | `login(licenseKey)` | `Promise<boolean>` | Validates key and stores signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
+| `selfBan(options?)` | `Promise<Record<string, unknown>>` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
 | `logout()` | `void` | Stops heartbeat and clears all session/auth state |
 | `isAuthenticated()` | `boolean` | `true` when an active authenticated session exists |
 | `getSessionData()` | `Record<string, unknown> \| null` | Full decoded payload map |
@@ -80,7 +94,7 @@ A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A
 If authentication fails (login rejected, heartbeat fails, signature mismatch, etc.), the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `process.exit(1)` to terminate the process.** This prevents your app from running without a valid license.
 
 Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`
 
 Request retries are automatic inside the internal HTTP layer:
 
@@ -109,9 +123,33 @@ const client = new AuthForgeClient(
 );
 ```
 
+## Self-ban (tamper response)
+
+Use `selfBan()` when your anti-tamper checks trip:
+
+```js
+// Post-session (authenticated): defaults to revoke + HWID/IP blacklist.
+await client.selfBan();
+
+// Pre-session: provide licenseKey, SDK automatically disables revokeLicense.
+await client.selfBan({ licenseKey: "AF-XXXX-XXXX-XXXX" });
+
+// Custom flags:
+await client.selfBan({
+  blacklistHwid: true,
+  blacklistIp: true,
+  revokeLicense: false,
+});
+```
+
+`selfBan()` selects request mode automatically:
+- Uses post-session mode when `sessionToken` is available (`options.sessionToken` or current SDK session).
+- Falls back to pre-session mode with `licenseKey` + nonce + app secret.
+- In pre-session mode, revoke is always disabled client-side to avoid unsafe key revocations.
+
 ## How It Works
 
-1. **Login** - Collects a hardware fingerprint (MAC, CPU, hostname), generates a random nonce, and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
+1. **Login** - Uses `hwidOverride` if provided; otherwise collects a hardware fingerprint (MAC, CPU, hostname). It then generates a random nonce and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
 
 2. **Heartbeat** - A background interval checks in at the configured cadence. In SERVER mode, it sends a fresh nonce and verifies the response. In LOCAL mode, it re-verifies the stored signature and checks expiry without network calls.
 
@@ -129,6 +167,8 @@ Material format:
 `SHA256("mac:<mac>|cpu:<cpu>|host:<hostname>")`
 
 Each component falls back to `unavailable` if it cannot be read.
+
+For non-device identities (for example Telegram users), pass `hwidOverride` such as `tg:<user_id>`.
 
 ## Test Vectors
 

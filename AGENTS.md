@@ -79,6 +79,9 @@ client.logout();
 | `onFailure` | `(reason: string, error: Error \| null) => void \| null` | no | `null` | Called on login/heartbeat/network failure; if omitted, process exits via `process.exit(1)` |
 | `requestTimeout` | `number` | no | `15` | HTTP timeout (seconds) |
 | `ttlSeconds` | `number \| null` | no | `null` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]` and preserves the lifetime across heartbeat refreshes. |
+| `hwidOverride` | `string \| null` | no | `null` | Optional custom HWID/subject string. When set to a non-empty value (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
+
+For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<user_id>`) instead of usernames.
 
 ## Methods
 
