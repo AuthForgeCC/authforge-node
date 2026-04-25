@@ -9,7 +9,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 ## Billing model (so you can pick sensible intervals)
 
-- **1 `login()` = 1 credit** (one `/auth/validate` debit).
+- **1 `login()` or `validateLicense()` = 1 credit** (one `/auth/validate` debit).
 - **10 heartbeats = 1 credit** (billed on every 10th successful heartbeat per license).
 - Any `heartbeatInterval` is safe — from `1` (server apps) to `900` (15 min, desktop apps). Revocations take effect on the **next** heartbeat regardless of interval.
 
@@ -88,6 +88,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 | Method | Returns | Description |
 | ------ | ------- | ----------- |
 | `login(licenseKey)` | `Promise<boolean>` | Validates license, verifies signatures, starts heartbeat interval |
+| `validateLicense(licenseKey)` | `Promise<ValidateLicenseResult>` | Same validate + signatures as login; does not mutate session or start heartbeats; **never** calls `onFailure` or `process.exit` — use the result object |
 | `logout()` | `void` | Stops heartbeat and clears session state |
 | `isAuthenticated()` | `boolean` | Whether a session token is present and marked authenticated |
 | `getSessionData()` | `Record<string, unknown> \| null` | Decoded signed payload map |

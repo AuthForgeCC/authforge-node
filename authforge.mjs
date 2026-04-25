@@ -361,7 +361,44 @@ export class AuthForgeClient {
     this._applySignedResponse(responseObject, expectedNonce, licenseKey, "validate");
   }
 
-  _applySignedResponse(responseObject, expectedNonce, licenseKey, context = "validate") {
+  /**
+   * Validates a license with the same request and Ed25519 verification as login,
+   * without mutating session state or starting heartbeats.
+   */
+  async validateLicense(licenseKey) {
+    if (!licenseKey || typeof licenseKey !== "string") {
+      throw new Error("licenseKey must be a non-empty string");
+    }
+    try {
+      const body = {
+        appId: this.appId,
+        appSecret: this.appSecret,
+        licenseKey,
+        hwid: this._hwid,
+        nonce: this._generateNonce(),
+      };
+      if (this.ttlSeconds !== null) {
+        body.ttlSeconds = this.ttlSeconds;
+      }
+      const responseObject = await this._postJson("/auth/validate", body, { skipFailureHook: true });
+      const expectedNonce = String(body.nonce ?? "").trim();
+      const parsed = this._parseValidateSuccess(responseObject, expectedNonce);
+      return {
+        valid: true,
+        sessionToken: parsed.sessionToken,
+        expiresIn: parsed.expiresIn,
+        sessionData: parsed.sessionData,
+        appVariables: parsed.appVariables,
+        licenseVariables: parsed.licenseVariables,
+        keyId: parsed.keyId,
+      };
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      return { valid: false, code: err.message, error: err };
+    }
+  }
+
+  _parseValidateSuccess(responseObject, expectedNonce) {
     if (!this._isSuccessStatus(responseObject?.status)) {
       throw new Error(this._extractServerError(responseObject));
     }
@@ -393,22 +430,40 @@ export class AuthForgeClient {
       throw new Error("missing_expiresIn");
     }
 
+    const keyId = typeof responseObject?.keyId === "string" ? responseObject.keyId : null;
+    return {
+      sessionToken,
+      expiresIn: Number.parseInt(String(expiresIn), 10),
+      sessionData: { ...payloadObject },
+      appVariables: this._extractOptionalMap(payloadObject.appVariables),
+      licenseVariables: this._extractOptionalMap(payloadObject.licenseVariables),
+      keyId,
+      rawPayloadB64,
+      signature,
+    };
+  }
+
+  _applySignedResponse(responseObject, expectedNonce, licenseKey, context = "validate") {
+    const parsed = this._parseValidateSuccess(responseObject, expectedNonce);
+    void context;
+
     if (licenseKey !== null) {
       this._licenseKey = licenseKey;
     }
-    this._sessionToken = sessionToken;
-    this._sessionExpiresIn = Number.parseInt(String(expiresIn), 10);
+    this._sessionToken = parsed.sessionToken;
+    this._sessionExpiresIn = parsed.expiresIn;
     this._lastNonce = expectedNonce;
-    this._rawPayloadB64 = rawPayloadB64;
-    this._signature = signature;
-    this._keyId = typeof responseObject?.keyId === "string" ? responseObject.keyId : null;
-    this._sessionData = { ...payloadObject };
-    this._appVariables = this._extractOptionalMap(payloadObject.appVariables);
-    this._licenseVariables = this._extractOptionalMap(payloadObject.licenseVariables);
+    this._rawPayloadB64 = parsed.rawPayloadB64;
+    this._signature = parsed.signature;
+    this._keyId = parsed.keyId;
+    this._sessionData = parsed.sessionData;
+    this._appVariables = parsed.appVariables;
+    this._licenseVariables = parsed.licenseVariables;
     this._authenticated = true;
   }
 
-  async _postJson(path, data) {
+  async _postJson(path, data, options = {}) {
+    const skipFailureHook = Boolean(options.skipFailureHook);
     const url = `${this.apiBaseUrl}${path}`;
     const body = { ...data };
     let rateAttempt = 0;
@@ -433,7 +488,9 @@ export class AuthForgeClient {
             await sleepSeconds(NETWORK_RETRY_DELAY);
             continue;
           }
-          this._fail("network_error", error);
+          if (!skipFailureHook) {
+            this._fail("network_error", error);
+          }
           throw new Error(`url_error: ${error}`);
         }
 

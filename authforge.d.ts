@@ -23,7 +23,28 @@ export interface AuthForgeClientOptions {
    * Omitted/null → server default (24h). Heartbeats preserve this TTL.
    */
   ttlSeconds?: number | null;
+  /** Custom HWID / identity (e.g. `discord:123`, `tg:456`). */
+  hwidOverride?: string | null;
 }
+
+export type ValidateLicenseSuccess = {
+  valid: true;
+  sessionToken: string;
+  expiresIn: number;
+  sessionData: SessionData;
+  appVariables: VariableMap | null;
+  licenseVariables: VariableMap | null;
+  keyId: string | null;
+};
+
+export type ValidateLicenseFailure = {
+  valid: false;
+  /** Machine-readable code (e.g. invalid_key, signature_mismatch, url_error: …). */
+  code: string;
+  error: Error;
+};
+
+export type ValidateLicenseResult = ValidateLicenseSuccess | ValidateLicenseFailure;
 
 export declare function verifyPayloadSignatureEd25519(
   payloadBase64: string,
@@ -56,6 +77,10 @@ export declare class AuthForgeClient {
   readonly ttlSeconds: number | null;
 
   login(licenseKey: string): Promise<boolean>;
+  /**
+   * Same cryptographic validation as login, without session mutation or heartbeats.
+   */
+  validateLicense(licenseKey: string): Promise<ValidateLicenseResult>;
   logout(): void;
   isAuthenticated(): boolean;
   getSessionData(): SessionData | null;

@@ -66,7 +66,7 @@ const client = new AuthForgeClient({
 
 ## Billing
 
-- **1 `login()` call = 1 credit** (one `/auth/validate` debit).
+- **1 `login()` or `validateLicense()` call = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats on the same license = 1 credit** (billed every 10th successful heartbeat).
 
 A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A server app running 24/7 at a 1-minute interval burns ~145 credits/day — pick the interval based on how fast you need revocations to propagate (they always take effect on the **next** heartbeat).
@@ -76,6 +76,7 @@ A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A
 | Method | Returns | Description |
 | --- | --- | --- |
 | `login(licenseKey)` | `Promise<boolean>` | Validates key and stores signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
+| `validateLicense(licenseKey)` | `Promise<ValidateLicenseResult>` | Same `/auth/validate` + signatures as `login`; does not store session or start heartbeats; failures return `{ valid: false }` and never call `onFailure` or `process.exit` |
 | `selfBan(options?)` | `Promise<Record<string, unknown>>` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
 | `logout()` | `void` | Stops heartbeat and clears all session/auth state |
 | `isAuthenticated()` | `boolean` | `true` when an active authenticated session exists |
@@ -92,6 +93,8 @@ A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A
 ## Failure Handling
 
 If authentication fails (login rejected, heartbeat fails, signature mismatch, etc.), the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `process.exit(1)` to terminate the process.** This prevents your app from running without a valid license.
+
+**`validateLicense()`** is different: it never starts heartbeats, does not mutate the client’s stored session, and **never** invokes `onFailure` or exits the process — inspect the returned `valid` / `code` fields instead.
 
 Recognized server errors:
 `invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`
