@@ -54,14 +54,62 @@ function createEd25519PublicKey(rawBase64) {
   });
 }
 
-export function verifyPayloadSignatureEd25519(payloadBase64, signatureBase64, publicKeyBase64) {
-  const isValid = verify(
-    null,
-    Buffer.from(payloadBase64, "utf8"),
-    createEd25519PublicKey(publicKeyBase64),
-    Buffer.from(signatureBase64, "base64"),
-  );
-  return isValid;
+/**
+ * Normalize the public-key argument into a non-empty array of base64 strings.
+ *
+ * Accepts:
+ *   - "abc..."                 (single key — historical contract)
+ *   - ["abc...", "def..."]     (key set — current first, previous(es) after)
+ *   - "abc...,def..."          (legacy comma-separated for env-var convenience)
+ *
+ * Returns the trimmed list of keys. Throws if no usable key is present so
+ * the constructor can surface "publicKey must be a non-empty string" errors
+ * unchanged.
+ */
+function normalizePublicKeyList(input) {
+  const out = [];
+  const push = (value) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (trimmed) out.push(trimmed);
+  };
+  if (Array.isArray(input)) {
+    for (const entry of input) push(entry);
+  } else if (typeof input === "string") {
+    if (input.includes(",")) {
+      for (const entry of input.split(",")) push(entry);
+    } else {
+      push(input);
+    }
+  }
+  return out;
+}
+
+/**
+ * Verify a payload signature against one or more trusted Ed25519 public keys.
+ *
+ * Accepting a list lets a deployment publish a new public key while clients
+ * are still pinned to the previous one — the SDK trusts both during the
+ * rotation window and falls back automatically when the server-side key
+ * changes. Returns `true` on the first match.
+ */
+export function verifyPayloadSignatureEd25519(payloadBase64, signatureBase64, publicKeyOrKeys) {
+  const keys = normalizePublicKeyList(publicKeyOrKeys);
+  if (keys.length === 0) return false;
+  for (const key of keys) {
+    try {
+      const isValid = verify(
+        null,
+        Buffer.from(payloadBase64, "utf8"),
+        createEd25519PublicKey(key),
+        Buffer.from(signatureBase64, "base64"),
+      );
+      if (isValid) return true;
+    } catch {
+      // Malformed key — try the next one rather than failing the whole set.
+    }
+  }
+  return false;
 }
 
 function postJson(urlText, body, timeoutSeconds) {
@@ -136,8 +184,9 @@ export class AuthForgeClient {
     if (!appSecret || typeof appSecret !== "string") {
       throw new Error("appSecret must be a non-empty string");
     }
-    if (!publicKey || typeof publicKey !== "string") {
-      throw new Error("publicKey must be a non-empty string");
+    const publicKeyList = normalizePublicKeyList(publicKey);
+    if (publicKeyList.length === 0) {
+      throw new Error("publicKey must be a non-empty string or array of strings");
     }
     const mode = String(heartbeatMode ?? "").toUpperCase();
     if (mode !== "LOCAL" && mode !== "SERVER") {
@@ -149,7 +198,11 @@ export class AuthForgeClient {
 
     this.appId = appId;
     this.appSecret = appSecret;
-    this.publicKey = publicKey;
+    // `publicKey` is the historical name; we now hold the full list to
+    // support key rotation, but expose `.publicKey` as the first (primary)
+    // entry for callers that read it directly.
+    this.publicKeys = publicKeyList;
+    this.publicKey = publicKeyList[0];
     this.heartbeatMode = mode;
     this.heartbeatInterval = Number.parseInt(String(heartbeatInterval), 10);
     this.apiBaseUrl = String(apiBaseUrl).replace(/\/+$/, "");
@@ -655,15 +708,18 @@ export class AuthForgeClient {
   }
 
   _verifySignature(rawPayloadB64, signature) {
-    const isValid = verify(
-      null,
-      Buffer.from(rawPayloadB64, "utf8"),
-      createEd25519PublicKey(this.publicKey),
-      Buffer.from(String(signature).trim(), "base64"),
-    );
-    if (!isValid) {
-      throw new Error("signature_mismatch");
+    const sigBuf = Buffer.from(String(signature).trim(), "base64");
+    const payloadBuf = Buffer.from(rawPayloadB64, "utf8");
+    for (const key of this.publicKeys) {
+      let isValid = false;
+      try {
+        isValid = verify(null, payloadBuf, createEd25519PublicKey(key), sigBuf);
+      } catch {
+        // Malformed entry — skip and try the next.
+      }
+      if (isValid) return;
     }
+    throw new Error("signature_mismatch");
   }
 
   _generateNonce() {

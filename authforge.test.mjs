@@ -88,6 +88,57 @@ test("validateLicense verifies response without heartbeat or session mutation", 
   assert.deepEqual(result.appVariables, { tier: "pro" });
 });
 
+test("verifyPayloadSignatureEd25519 accepts an array of trusted keys", async () => {
+  const vectors = await readVectors();
+  const validateCase = vectors.cases.find((item) => item.id === "validate_success");
+  assert.ok(validateCase);
+  // Bogus key first, real key second — verification must succeed by trying
+  // each entry instead of bailing on the first miss.
+  const decoyKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  const valid = verifyPayloadSignatureEd25519(
+    validateCase.payload,
+    validateCase.signature,
+    [decoyKey, vectors.publicKey],
+  );
+  assert.equal(valid, true);
+});
+
+test("verifyPayloadSignatureEd25519 also accepts comma-separated env-var form", async () => {
+  const vectors = await readVectors();
+  const validateCase = vectors.cases.find((item) => item.id === "validate_success");
+  const decoyKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  const combined = `${decoyKey},${vectors.publicKey}`;
+  const valid = verifyPayloadSignatureEd25519(
+    validateCase.payload,
+    validateCase.signature,
+    combined,
+  );
+  assert.equal(valid, true);
+});
+
+test("client constructor accepts an array of public keys (rotation set)", async () => {
+  const vectors = await readVectors();
+  const validateCase = vectors.cases.find((item) => item.id === "validate_success");
+  const decoyKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  const client = new AuthForgeClient(
+    "app-id",
+    "app-secret",
+    [decoyKey, vectors.publicKey],
+    "LOCAL",
+    900,
+    undefined,
+    () => {},
+  );
+  assert.deepEqual(client.publicKeys, [decoyKey, vectors.publicKey]);
+  assert.equal(client.publicKey, decoyKey);
+  // Local heartbeat verification must still succeed because the *second* key
+  // in the trust list matches the signature.
+  client._rawPayloadB64 = validateCase.payload;
+  client._signature = validateCase.signature;
+  client._sessionExpiresIn = Math.floor(Date.now() / 1000) + 60;
+  client._localHeartbeat();
+});
+
 test("validateLicense returns structured failure without starting heartbeat", async () => {
   const vectors = await readVectors();
   const client = new AuthForgeClient(
