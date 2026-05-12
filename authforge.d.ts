@@ -41,6 +41,13 @@ export type ValidateLicenseSuccess = {
   appVariables: VariableMap | null;
   licenseVariables: VariableMap | null;
   keyId: string | null;
+  /** ISO 8601 session expiry (newer servers). */
+  sessionExpiresAt?: string;
+  /** ISO 8601 license expiry; `null` when key is lifetime (explicit JSON null). */
+  licenseExpiresAt?: string | null;
+  maxHwidSlots?: number;
+  hwidCount?: number;
+  licenseLabel?: string;
 };
 
 export type ValidateLicenseFailure = {

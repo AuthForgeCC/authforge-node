@@ -444,6 +444,11 @@ export class AuthForgeClient {
         appVariables: parsed.appVariables,
         licenseVariables: parsed.licenseVariables,
         keyId: parsed.keyId,
+        ...(parsed.sessionExpiresAt !== undefined ? { sessionExpiresAt: parsed.sessionExpiresAt } : {}),
+        ...(parsed.licenseExpiresAt !== undefined ? { licenseExpiresAt: parsed.licenseExpiresAt } : {}),
+        ...(parsed.maxHwidSlots !== undefined ? { maxHwidSlots: parsed.maxHwidSlots } : {}),
+        ...(parsed.hwidCount !== undefined ? { hwidCount: parsed.hwidCount } : {}),
+        ...(parsed.licenseLabel !== undefined ? { licenseLabel: parsed.licenseLabel } : {}),
       };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -484,6 +489,30 @@ export class AuthForgeClient {
     }
 
     const keyId = typeof responseObject?.keyId === "string" ? responseObject.keyId : null;
+    /** @type {Record<string, unknown>} */
+    const extra = {};
+    if (typeof payloadObject.sessionExpiresAt === "string" && payloadObject.sessionExpiresAt !== "") {
+      extra.sessionExpiresAt = payloadObject.sessionExpiresAt;
+    }
+    if (Object.hasOwn(payloadObject, "licenseExpiresAt")) {
+      const le = payloadObject.licenseExpiresAt;
+      extra.licenseExpiresAt = typeof le === "string" ? le : null;
+    }
+    if (payloadObject.maxHwidSlots !== undefined && payloadObject.maxHwidSlots !== null) {
+      const n = Number.parseInt(String(payloadObject.maxHwidSlots), 10);
+      if (!Number.isNaN(n)) {
+        extra.maxHwidSlots = n;
+      }
+    }
+    if (payloadObject.hwidCount !== undefined && payloadObject.hwidCount !== null) {
+      const n = Number.parseInt(String(payloadObject.hwidCount), 10);
+      if (!Number.isNaN(n)) {
+        extra.hwidCount = n;
+      }
+    }
+    if (typeof payloadObject.licenseLabel === "string" && payloadObject.licenseLabel !== "") {
+      extra.licenseLabel = payloadObject.licenseLabel;
+    }
     return {
       sessionToken,
       expiresIn: Number.parseInt(String(expiresIn), 10),
@@ -493,6 +522,7 @@ export class AuthForgeClient {
       keyId,
       rawPayloadB64,
       signature,
+      ...extra,
     };
   }
 
