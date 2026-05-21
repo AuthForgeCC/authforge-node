@@ -21,6 +21,7 @@ const KNOWN_SERVER_ERRORS = new Set([
   "session_expired",
   "revoke_requires_session",
   "bad_request",
+  "malformed_request",
   "system_error",
 ]);
 
@@ -192,8 +193,8 @@ export class AuthForgeClient {
     if (mode !== "LOCAL" && mode !== "SERVER") {
       throw new Error("heartbeatMode must be LOCAL or SERVER");
     }
-    if (heartbeatInterval <= 0) {
-      throw new Error("heartbeatInterval must be > 0");
+    if (heartbeatInterval < 10) {
+      throw new Error("heartbeatInterval must be >= 10");
     }
 
     this.appId = appId;

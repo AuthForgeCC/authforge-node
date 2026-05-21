@@ -45,7 +45,7 @@ You can also copy `authforge.mjs` directly into your project if you prefer a sin
 | `appSecret` | `string` | required | Your application secret from the AuthForge dashboard |
 | `publicKey` | `string` | required | App Ed25519 public key (base64) from dashboard |
 | `heartbeatMode` | `string` | required | `"SERVER"` or `"LOCAL"` (see below) |
-| `heartbeatInterval` | `number` | `900` | Seconds between heartbeat checks (any value ≥ 1; default 15 min) |
+| `heartbeatInterval` | `number` | `900` | Seconds between heartbeat checks (minimum `10`; default 15 min) |
 | `apiBaseUrl` | `string` | `https://auth.authforge.cc` | API endpoint |
 | `onFailure` | `function` | `null` | Callback `(reason: string, error: Error \| null)` on auth failure |
 | `requestTimeout` | `number` | `15` | HTTP request timeout in seconds |
@@ -69,7 +69,7 @@ const client = new AuthForgeClient({
 - **1 `login()` or `validateLicense()` call = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats on the same license = 1 credit** (billed every 10th successful heartbeat).
 
-A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A server app running 24/7 at a 1-minute interval burns ~145 credits/day — pick the interval based on how fast you need revocations to propagate (they always take effect on the **next** heartbeat).
+A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. `/auth/heartbeat` is limited to 6 requests/minute per license key, so keep intervals at 10 seconds or higher and pick cadence based on revocation speed needs (they always take effect on the **next** heartbeat).
 
 ## Methods
 
@@ -97,7 +97,7 @@ If authentication fails (login rejected, heartbeat fails, signature mismatch, et
 **`validateLicense()`** is different: it never starts heartbeats, does not mutate the client’s stored session, and **never** invokes `onFailure` or exits the process — inspect the returned `valid` / `code` fields instead.
 
 Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `system_error`
 
 Request retries are automatic inside the internal HTTP layer:
 
