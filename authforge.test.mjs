@@ -28,11 +28,99 @@ test("ed25519 vectors verify expected signatures", async () => {
 test("client constructor requires public key", () => {
   assert.throws(() => {
     // @ts-expect-error constructor hard break
-    new AuthForgeClient("app-id", "app-secret", "LOCAL");
+    new AuthForgeClient("app-id", "app-secret");
   });
 });
 
-test("local heartbeat verifies stored signature with public key", async () => {
+test("default policy is grace period: onlineHeartbeat false, heartbeatMode LOCAL", () => {
+  const client = new AuthForgeClient({
+    appId: "app-id",
+    appSecret: "app-secret",
+    publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    onFailure: () => {},
+  });
+  assert.equal(client.onlineHeartbeat, false);
+  assert.equal(client.heartbeatMode, "LOCAL");
+});
+
+test("legacy heartbeatMode SERVER maps to onlineHeartbeat true", () => {
+  const client = new AuthForgeClient({
+    appId: "app-id",
+    appSecret: "app-secret",
+    publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    heartbeatMode: "SERVER",
+    onFailure: () => {},
+  });
+  assert.equal(client.onlineHeartbeat, true);
+  assert.equal(client.heartbeatMode, "SERVER");
+});
+
+test("legacy heartbeatMode LOCAL maps to onlineHeartbeat false", () => {
+  const client = new AuthForgeClient({
+    appId: "app-id",
+    appSecret: "app-secret",
+    publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    heartbeatMode: "LOCAL",
+    onFailure: () => {},
+  });
+  assert.equal(client.onlineHeartbeat, false);
+  assert.equal(client.heartbeatMode, "LOCAL");
+});
+
+test("onlineHeartbeat: true enables online check-ins without heartbeatMode", () => {
+  const client = new AuthForgeClient({
+    appId: "app-id",
+    appSecret: "app-secret",
+    publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    onlineHeartbeat: true,
+    onFailure: () => {},
+  });
+  assert.equal(client.onlineHeartbeat, true);
+  assert.equal(client.heartbeatMode, "SERVER");
+});
+
+test("invalid heartbeatMode still throws", () => {
+  assert.throws(
+    () => {
+      new AuthForgeClient({
+        appId: "app-id",
+        appSecret: "app-secret",
+        publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        heartbeatMode: "SOMETIMES",
+        onFailure: () => {},
+      });
+    },
+    { message: "heartbeatMode must be LOCAL or SERVER" },
+  );
+});
+
+test("legacy positional heartbeatMode still works and emits a deprecation warning", async () => {
+  const warnings = [];
+  const onWarning = (warning) => warnings.push(warning);
+  process.on("warning", onWarning);
+  try {
+    const client = new AuthForgeClient(
+      "app-id",
+      "app-secret",
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "server",
+      900,
+      undefined,
+      () => {},
+    );
+    assert.equal(client.onlineHeartbeat, true);
+    assert.equal(client.heartbeatMode, "SERVER");
+    // Warnings are delivered asynchronously on the next tick.
+    await new Promise((resolve) => setImmediate(resolve));
+    const deprecation = warnings.find((warning) => warning.name === "DeprecationWarning");
+    assert.ok(deprecation);
+    assert.match(deprecation.message, /onlineHeartbeat: true/);
+  } finally {
+    process.off("warning", onWarning);
+  }
+});
+
+test("grace period check verifies stored signature with public key", async () => {
   const vectors = await readVectors();
   const validateCase = vectors.cases.find((item) => item.id === "validate_success");
   assert.ok(validateCase);
@@ -41,7 +129,7 @@ test("local heartbeat verifies stored signature with public key", async () => {
     "app-id",
     "app-secret",
     vectors.publicKey,
-    "LOCAL",
+    undefined,
     900,
     undefined,
     () => {},
@@ -49,7 +137,27 @@ test("local heartbeat verifies stored signature with public key", async () => {
   client._rawPayloadB64 = validateCase.payload;
   client._signature = validateCase.signature;
   client._sessionExpiresIn = Math.floor(Date.now() / 1000) + 60;
-  client._localHeartbeat();
+  client._gracePeriodCheck();
+});
+
+test("grace period check fails after the session TTL expires", async () => {
+  const vectors = await readVectors();
+  const validateCase = vectors.cases.find((item) => item.id === "validate_success");
+  assert.ok(validateCase);
+
+  const client = new AuthForgeClient(
+    "app-id",
+    "app-secret",
+    vectors.publicKey,
+    undefined,
+    900,
+    undefined,
+    () => {},
+  );
+  client._rawPayloadB64 = validateCase.payload;
+  client._signature = validateCase.signature;
+  client._sessionExpiresIn = Math.floor(Date.now() / 1000) - 1;
+  assert.throws(() => client._gracePeriodCheck(), { message: "session_expired" });
 });
 
 test("validateLicense verifies response without heartbeat or session mutation", async () => {
@@ -61,7 +169,7 @@ test("validateLicense verifies response without heartbeat or session mutation", 
     "app-id",
     "app-secret",
     vectors.publicKey,
-    "LOCAL",
+    undefined,
     900,
     undefined,
     () => {},
@@ -124,19 +232,19 @@ test("client constructor accepts an array of public keys (rotation set)", async 
     "app-id",
     "app-secret",
     [decoyKey, vectors.publicKey],
-    "LOCAL",
+    undefined,
     900,
     undefined,
     () => {},
   );
   assert.deepEqual(client.publicKeys, [decoyKey, vectors.publicKey]);
   assert.equal(client.publicKey, decoyKey);
-  // Local heartbeat verification must still succeed because the *second* key
+  // Grace period verification must still succeed because the *second* key
   // in the trust list matches the signature.
   client._rawPayloadB64 = validateCase.payload;
   client._signature = validateCase.signature;
   client._sessionExpiresIn = Math.floor(Date.now() / 1000) + 60;
-  client._localHeartbeat();
+  client._gracePeriodCheck();
 });
 
 test("validateLicense returns structured failure without starting heartbeat", async () => {
@@ -145,7 +253,7 @@ test("validateLicense returns structured failure without starting heartbeat", as
     "app-id",
     "app-secret",
     vectors.publicKey,
-    "LOCAL",
+    undefined,
     900,
     undefined,
     () => {},

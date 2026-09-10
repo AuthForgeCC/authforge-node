@@ -165,12 +165,14 @@ export class AuthForgeClient {
     ttlSeconds = null,
     hwidOverride = null,
   ) {
+    let onlineHeartbeat = false;
     if (appId && typeof appId === "object" && !Array.isArray(appId)) {
       const options = appId;
       appId = options.appId;
       appSecret = options.appSecret;
       publicKey = options.publicKey;
       heartbeatMode = options.heartbeatMode;
+      onlineHeartbeat = options.onlineHeartbeat ?? false;
       heartbeatInterval = options.heartbeatInterval ?? 900;
       apiBaseUrl = options.apiBaseUrl ?? DEFAULT_API_BASE_URL;
       onFailure = options.onFailure ?? null;
@@ -189,9 +191,19 @@ export class AuthForgeClient {
     if (publicKeyList.length === 0) {
       throw new Error("publicKey must be a non-empty string or array of strings");
     }
-    const mode = String(heartbeatMode ?? "").toUpperCase();
-    if (mode !== "LOCAL" && mode !== "SERVER") {
-      throw new Error("heartbeatMode must be LOCAL or SERVER");
+    // `heartbeatMode` is a deprecated shim. The product policy is:
+    // grace period by default (no network after activate/validate until the
+    // session TTL expires), or opt-in online check-ins via `onlineHeartbeat`.
+    let mode = null;
+    if (heartbeatMode !== null && heartbeatMode !== undefined && String(heartbeatMode) !== "") {
+      mode = String(heartbeatMode).toUpperCase();
+      if (mode !== "LOCAL" && mode !== "SERVER") {
+        throw new Error("heartbeatMode must be LOCAL or SERVER");
+      }
+      process.emitWarning(
+        "heartbeatMode is deprecated: use onlineHeartbeat: true for online check-ins; the default is the grace period behavior",
+        "DeprecationWarning",
+      );
     }
     if (heartbeatInterval < 10) {
       throw new Error("heartbeatInterval must be >= 10");
@@ -204,11 +216,17 @@ export class AuthForgeClient {
     // entry for callers that read it directly.
     this.publicKeys = publicKeyList;
     this.publicKey = publicKeyList[0];
-    this.heartbeatMode = mode;
+    // Effective policy: online check-ins when opted in explicitly or via the
+    // legacy "SERVER" mode; otherwise the grace period behavior.
+    this.onlineHeartbeat = Boolean(onlineHeartbeat) || mode === "SERVER";
+    // Back-compat alias for callers that still read `heartbeatMode`.
+    this.heartbeatMode = this.onlineHeartbeat ? "SERVER" : "LOCAL";
     this.heartbeatInterval = Number.parseInt(String(heartbeatInterval), 10);
     this.apiBaseUrl = String(apiBaseUrl).replace(/\/+$/, "");
     this.onFailure = typeof onFailure === "function" ? onFailure : null;
     this.requestTimeout = requestTimeout;
+    // Requested grace period duration in seconds (equals the session TTL).
+    // Server default is 24h; the server clamps requests to 1h..7d.
     const parsedTtl = Number.parseInt(String(ttlSeconds ?? ""), 10);
     this.ttlSeconds = Number.isFinite(parsedTtl) && parsedTtl > 0 ? parsedTtl : null;
 
@@ -348,10 +366,10 @@ export class AuthForgeClient {
 
   async _heartbeatTick() {
     try {
-      if (this.heartbeatMode === "SERVER") {
+      if (this.onlineHeartbeat) {
         await this._serverHeartbeat();
       } else {
-        this._localHeartbeat();
+        this._gracePeriodCheck();
       }
     } catch (error) {
       this._fail("heartbeat_failed", error);
@@ -379,7 +397,12 @@ export class AuthForgeClient {
     this._applySignedResponse(responseObject, expectedNonce, null, "heartbeat");
   }
 
-  _localHeartbeat() {
+  /**
+   * Grace period check: without any network call, re-verify the signed
+   * session obtained from activate/validate and fail once the session TTL
+   * (the grace period) has expired.
+   */
+  _gracePeriodCheck() {
     const rawPayloadB64 = this._rawPayloadB64;
     const signature = this._signature;
     const expiresIn = this._sessionExpiresIn;

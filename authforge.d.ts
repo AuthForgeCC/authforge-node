@@ -18,15 +18,28 @@ export interface AuthForgeClientOptions {
    * accepted for environment-variable convenience.
    */
   publicKey: string | readonly string[];
-  heartbeatMode: string;
+  /**
+   * Enable online check-ins: periodic POST /auth/heartbeat calls for fast
+   * revocation and concurrent-use detection. Defaults to `false`, which means
+   * the client runs through the grace period on the signed session without
+   * contacting AuthForge until the session TTL expires.
+   */
+  onlineHeartbeat?: boolean;
+  /**
+   * @deprecated Use `onlineHeartbeat: true` for online check-ins; the default
+   * is the grace period behavior. "SERVER" maps to `onlineHeartbeat: true`,
+   * "LOCAL" maps to the default.
+   */
+  heartbeatMode?: string;
   heartbeatInterval?: number;
   apiBaseUrl?: string;
   onFailure?: ((reason: string, error: Error | null) => void) | null;
   requestTimeout?: number;
   /**
-   * Requested session token lifetime in seconds. Server clamps to
-   * [3600, 604800]; out-of-range values are silently clamped.
-   * Omitted/null → server default (24h). Heartbeats preserve this TTL.
+   * Requested grace period duration in seconds (equals the session token
+   * lifetime). Server default is 24h (86400); the server clamps requests to
+   * [3600, 604800] (1h to 7d). Omitted/null uses the server default.
+   * Online check-ins preserve this TTL.
    */
   ttlSeconds?: number | null;
   /** Custom HWID / identity (e.g. `discord:123`, `tg:456`). */
@@ -71,7 +84,7 @@ export declare class AuthForgeClient {
     appId: string,
     appSecret: string,
     publicKey: string | readonly string[],
-    heartbeatMode: string,
+    heartbeatMode?: string,
     heartbeatInterval?: number,
     apiBaseUrl?: string,
     onFailure?: ((reason: string, error: Error | null) => void) | null,
@@ -84,6 +97,15 @@ export declare class AuthForgeClient {
   /** Primary (first) trusted public key. See `publicKeys` for the full list. */
   readonly publicKey: string;
   readonly publicKeys: readonly string[];
+  /**
+   * Effective policy: `true` when online check-ins are enabled, `false` when
+   * the client relies on the grace period.
+   */
+  readonly onlineHeartbeat: boolean;
+  /**
+   * @deprecated Read `onlineHeartbeat` instead. "SERVER" when online
+   * check-ins are enabled, "LOCAL" otherwise.
+   */
   readonly heartbeatMode: HeartbeatMode;
   readonly heartbeatInterval: number;
   readonly apiBaseUrl: string;

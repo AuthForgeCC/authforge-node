@@ -1,8 +1,31 @@
 # AuthForge Node.js SDK
 
-Official Node.js SDK for [AuthForge](https://authforge.cc) - credit-based license key authentication with Ed25519-verified responses.
+Official Node.js SDK for [AuthForge](https://authforge.cc): credit-based license key authentication with Ed25519-verified responses.
 
 **Zero dependencies.** Node.js built-ins only. Works on Node.js 18+.
+
+## How licensing works
+
+1. **Activate**: the SDK calls `POST /auth/validate` once. The server checks revocation, expiry, HWID binding, and credits, then returns an Ed25519-signed session with a TTL.
+2. **Grace period (default)**: the app keeps running on that signed session without contacting AuthForge. The SDK periodically re-verifies the signature and expiry locally and fails once the TTL expires. The grace period equals the session TTL: default 24h, and the server clamps requests to 1h to 7d (`ttlSeconds`).
+3. **Online check-ins (optional)**: set `onlineHeartbeat: true` to have the SDK call `POST /auth/heartbeat` every `heartbeatInterval` seconds for fast revocation and concurrent-use detection.
+
+## Features
+
+Everything in this list ships in `authforge.mjs` today:
+
+- **License validation** via `POST /auth/validate`, returning a signed session payload.
+- **Ed25519 signature verification** on every `/auth/validate` and `/auth/heartbeat` response; tampered or unsigned responses are rejected. `verifyPayloadSignatureEd25519()` is also exported for standalone use.
+- **Key rotation**: `publicKey` accepts a single key, an array of keys, or a comma-separated string. The SDK trusts a signature that matches **any** key in the list, so you can roll the server-side signing key without breaking deployed clients.
+- **Nonce anti-replay**: a fresh 128-bit nonce is sent on every request and the echoed nonce in the signed payload is checked before the response is accepted.
+- **HWID fingerprinting**: deterministic device hash from MAC + CPU + hostname, with graceful per-component fallback.
+- **`hwidOverride`**: bind to any identity instead of the machine (for example `tg:<id>`, `discord:<id>`).
+- **Seat enforcement**: the server binds each HWID into a license's free slots up to `maxHwidSlots`; `hwidCount` / `maxHwidSlots` are surfaced on the result. A shared (unlimited-seat) key skips per-device binding.
+- **Grace period by default, optional online check-ins** (see [Grace period and online check-ins](#grace-period-and-online-check-ins)).
+- **Self-ban** (`selfBan()`) for anti-tamper response, both pre-session and post-session.
+- **Configurable grace period** (`ttlSeconds`) with server-side clamping to `[3600, 604800]`.
+- **App variables / license variables** for feature flags and tiered licensing.
+- **Automatic retries** for rate-limited and transient network failures, with a fresh nonce per retry.
 
 ## Quick Start
 
@@ -17,22 +40,34 @@ Then:
 ```js
 import { AuthForgeClient } from "@authforgecc/sdk";
 
-const client = new AuthForgeClient(
-  "YOUR_APP_ID", // from your AuthForge dashboard
-  "YOUR_APP_SECRET", // from your AuthForge dashboard
-  "YOUR_PUBLIC_KEY", // from your AuthForge dashboard
-  "SERVER", // "SERVER" or "LOCAL"
-);
+const client = new AuthForgeClient({
+  appId: "YOUR_APP_ID", // from your AuthForge dashboard
+  appSecret: "YOUR_APP_SECRET", // from your AuthForge dashboard
+  publicKey: "YOUR_PUBLIC_KEY", // from your AuthForge dashboard
+});
 
 const licenseKey = process.argv[2];
 
 if (await client.login(licenseKey)) {
   console.log("Authenticated!");
-  // Your app logic here - heartbeats run automatically in the background
+  // Your app logic here. The app runs through the grace period by default;
+  // no further network calls until the session TTL expires.
 } else {
   console.error("Invalid license key.");
   process.exit(1);
 }
+```
+
+To enable online check-ins:
+
+```js
+const client = new AuthForgeClient({
+  appId: "YOUR_APP_ID",
+  appSecret: "YOUR_APP_SECRET",
+  publicKey: "YOUR_PUBLIC_KEY",
+  onlineHeartbeat: true,
+  heartbeatInterval: 900, // seconds between check-ins
+});
 ```
 
 You can also copy `authforge.mjs` directly into your project if you prefer a single-file integration.
@@ -43,13 +78,14 @@ You can also copy `authforge.mjs` directly into your project if you prefer a sin
 | --- | --- | --- | --- |
 | `appId` | `string` | required | Your application ID from the AuthForge dashboard |
 | `appSecret` | `string` | required | Your application secret from the AuthForge dashboard |
-| `publicKey` | `string` | required | App Ed25519 public key (base64) from dashboard |
-| `heartbeatMode` | `string` | required | `"SERVER"` or `"LOCAL"` (see below) |
-| `heartbeatInterval` | `number` | `900` | Seconds between heartbeat checks (minimum `10`; default 15 min) |
+| `publicKey` | `string \| readonly string[]` | required | App Ed25519 public key(s) (base64) from dashboard. Pass one key, an array, or a comma-separated string to trust multiple keys during rotation (see [Key rotation](#key-rotation)). |
+| `onlineHeartbeat` | `boolean` | `false` | Enable online check-ins: periodic `/auth/heartbeat` calls for fast revocation and concurrent-use detection. When `false` (the default), the app runs through the grace period without contacting AuthForge. |
+| `heartbeatMode` | `string` | none | **Deprecated.** `"SERVER"` maps to `onlineHeartbeat: true`; `"LOCAL"` maps to the default. See [Migrating from heartbeatMode](#migrating-from-heartbeatmode). |
+| `heartbeatInterval` | `number` | `900` | Seconds between checks (online check-ins or local grace period re-verification; minimum `10`; default 15 min) |
 | `apiBaseUrl` | `string` | `https://auth.authforge.cc` | API endpoint |
 | `onFailure` | `function` | `null` | Callback `(reason: string, error: Error \| null)` on auth failure |
 | `requestTimeout` | `number` | `15` | HTTP request timeout in seconds |
-| `ttlSeconds` | `number \| null` | `null` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
+| `ttlSeconds` | `number \| null` | `null` (server default: 86400) | Requested grace period duration (session TTL) in seconds. Server clamps to `[3600, 604800]` (1h to 7d); preserved across online check-ins. |
 | `hwidOverride` | `string \| null` | `null` | Optional custom hardware/subject identifier. When set to a non-empty value, the SDK uses it instead of machine fingerprinting. |
 
 ### Identity-based binding example (Telegram/Discord)
@@ -59,45 +95,81 @@ const client = new AuthForgeClient({
   appId: "YOUR_APP_ID",
   appSecret: "YOUR_APP_SECRET",
   publicKey: "YOUR_PUBLIC_KEY",
-  heartbeatMode: "SERVER",
   hwidOverride: `tg:${telegramUserId}`, // or `discord:${discordUserId}`
 });
 ```
 
+### Key rotation
+
+`publicKey` is a trust list. To rotate the server-side signing key without a
+flag-day, ship the **new** key alongside the **previous** one; the SDK accepts a
+signature that matches any entry:
+
+```js
+const client = new AuthForgeClient({
+  appId: "YOUR_APP_ID",
+  appSecret: "YOUR_APP_SECRET",
+  publicKey: ["NEW_PUBLIC_KEY", "PREVIOUS_PUBLIC_KEY"], // or "NEW,PREVIOUS"
+});
+```
+
+`client.publicKeys` exposes the full trust list; `client.publicKey` is the first
+(primary) entry.
+
+## Grace period and online check-ins
+
+**Grace period (default)**: after one successful online activate/validate, the app keeps running on the Ed25519-signed session without contacting AuthForge. The SDK re-verifies the cached signature and checks the expiry timestamp locally at the configured interval; when the session TTL expires it triggers failure with `session_expired`. The grace period equals the session TTL (default 24h, server clamps 1h to 7d via `ttlSeconds`). It is session continuation, not persistent offline licensing: a mid-session revocation is not picked up until the next online validate or check-in.
+
+**Online check-ins (`onlineHeartbeat: true`)**: the SDK calls `/auth/heartbeat` every `heartbeatInterval` seconds with a fresh nonce, verifies signature + nonce, and triggers failure on invalid session state. Use this when you need fast revocation or concurrent-use detection.
+
+## Migrating from heartbeatMode
+
+`heartbeatMode` is deprecated. It still works, but constructing a client with it emits a `DeprecationWarning`.
+
+- `heartbeatMode: "LOCAL"` maps to the default: remove the option entirely.
+- `heartbeatMode: "SERVER"` maps to `onlineHeartbeat: true`.
+- If both options are set, either one enables online check-ins: `heartbeatMode: "SERVER"` is not overridden by `onlineHeartbeat: false`.
+
+```js
+// Before
+new AuthForgeClient({ appId, appSecret, publicKey, heartbeatMode: "LOCAL" });
+new AuthForgeClient({ appId, appSecret, publicKey, heartbeatMode: "SERVER" });
+
+// After
+new AuthForgeClient({ appId, appSecret, publicKey });
+new AuthForgeClient({ appId, appSecret, publicKey, onlineHeartbeat: true });
+```
+
+The `client.heartbeatMode` property is also kept for compatibility: it reads `"SERVER"` when online check-ins are enabled and `"LOCAL"` otherwise. Prefer reading `client.onlineHeartbeat`.
+
 ## Billing
 
 - **1 `login()` or `validateLicense()` call = 1 credit** (one `/auth/validate` debit each).
-- **10 heartbeats on the same license = 1 credit** (billed every 10th successful heartbeat).
+- **10 online check-ins on the same license = 1 credit** (billed every 10th successful check-in). The grace period costs nothing after the initial activate.
 
-A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. `/auth/heartbeat` is limited to 6 requests/minute per license key, so keep intervals at 10 seconds or higher and pick cadence based on revocation speed needs (they always take effect on the **next** heartbeat).
+A desktop app running 6h/day with online check-ins at a 15-minute interval burns ~3-4 credits/day. `/auth/heartbeat` is limited to 6 requests/minute per license key, so keep intervals at 10 seconds or higher and pick cadence based on revocation speed needs (revocations always take effect on the **next** check-in).
 
 ## Methods
 
 | Method | Returns | Description |
 | --- | --- | --- |
-| `login(licenseKey)` | `Promise<boolean>` | Validates key and stores signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
-| `validateLicense(licenseKey)` | `Promise<ValidateLicenseResult>` | Same `/auth/validate` + signatures as `login`; does not store session or start heartbeats; failures return `{ valid: false }` and never call `onFailure` or `process.exit` |
+| `login(licenseKey)` | `Promise<boolean>` | Activates online: validates the key and stores the signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
+| `validateLicense(licenseKey)` | `Promise<ValidateLicenseResult>` | Same `/auth/validate` + signatures as `login`; does not store session or start background checks; failures return `{ valid: false }` and never call `onFailure` or `process.exit` |
 | `selfBan(options?)` | `Promise<Record<string, unknown>>` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
-| `logout()` | `void` | Stops heartbeat and clears all session/auth state |
+| `logout()` | `void` | Stops background checks and clears all session/auth state |
 | `isAuthenticated()` | `boolean` | `true` when an active authenticated session exists |
 | `getSessionData()` | `Record<string, unknown> \| null` | Full decoded payload map |
 | `getAppVariables()` | `Record<string, unknown> \| null` | App-scoped variables map |
 | `getLicenseVariables()` | `Record<string, unknown> \| null` | License-scoped variables map |
 
-## Heartbeat Modes
-
-**SERVER** - The SDK calls `/auth/heartbeat` every `heartbeatInterval` seconds with a fresh nonce, verifies signature + nonce, and triggers failure on invalid session state.
-
-**LOCAL** - No network calls. The SDK re-verifies stored signature state and checks expiry timestamp locally. If expired, it triggers failure with `session_expired`.
-
 ## Failure Handling
 
-If authentication fails (login rejected, heartbeat fails, signature mismatch, etc.), the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `process.exit(1)` to terminate the process.** This prevents your app from running without a valid license.
+If authentication fails (login rejected, check-in fails, grace period expired, signature mismatch, etc.), the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `process.exit(1)` to terminate the process.** This prevents your app from running without a valid license.
 
-**`validateLicense()`** is different: it never starts heartbeats, does not mutate the client’s stored session, and **never** invokes `onFailure` or exits the process — inspect the returned `valid` / `code` fields instead.
+**`validateLicense()`** is different: it never starts background checks, does not mutate the client's stored session, and **never** invokes `onFailure` or exits the process. Inspect the returned `valid` / `code` fields instead.
 
-Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `system_error`
+Recognized server errors (`knownServerErrors`):
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `system_error`
 
 Request retries are automatic inside the internal HTTP layer:
 
@@ -115,15 +187,13 @@ const handleAuthFailure = (reason, error) => {
   process.exit(1);
 };
 
-const client = new AuthForgeClient(
-  "YOUR_APP_ID",
-  "YOUR_APP_SECRET",
-  "YOUR_PUBLIC_KEY",
-  "SERVER",
-  900,
-  "https://auth.authforge.cc",
-  handleAuthFailure,
-);
+const client = new AuthForgeClient({
+  appId: "YOUR_APP_ID",
+  appSecret: "YOUR_APP_SECRET",
+  publicKey: "YOUR_PUBLIC_KEY",
+  onlineHeartbeat: true,
+  onFailure: handleAuthFailure,
+});
 ```
 
 ## Self-ban (tamper response)
@@ -152,9 +222,9 @@ await client.selfBan({
 
 ## How It Works
 
-1. **Login** - Uses `hwidOverride` if provided; otherwise collects a hardware fingerprint (MAC, CPU, hostname). It then generates a random nonce and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
+1. **Activate** - Uses `hwidOverride` if provided; otherwise collects a hardware fingerprint (MAC, CPU, hostname). It then generates a random nonce and sends everything to the AuthForge API via `/auth/validate`. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload with a TTL. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
 
-2. **Heartbeat** - A background interval checks in at the configured cadence. In SERVER mode, it sends a fresh nonce and verifies the response. In LOCAL mode, it re-verifies the stored signature and checks expiry without network calls.
+2. **Background checks** - A background interval runs at the configured cadence. With online check-ins enabled, it calls `/auth/heartbeat` with a fresh nonce and verifies the response. Otherwise it re-verifies the stored signature and checks the grace period expiry without network calls.
 
 3. **Crypto** - Both `/validate` and `/heartbeat` responses are signed by AuthForge with your app's Ed25519 private key. The SDK verifies every signed `payload` using your configured `publicKey` and rejects tampered responses.
 
