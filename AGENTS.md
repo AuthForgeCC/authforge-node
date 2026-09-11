@@ -14,7 +14,7 @@ After activation the client follows one of two policies:
 
 If the license is revoked or expired, the background check fails and you handle it (typically exit the app).
 
-There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `loginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login()` + grace period.
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `loginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (omit `appSecret`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login()` + grace period.
 
 ## Billing model (so you can pick sensible intervals)
 
@@ -80,7 +80,7 @@ This default configuration activates online once and then runs through the grace
 | Parameter | Type | Required | Default | Description |
 | --------- | ---- | -------- | ------- | ----------- |
 | `appId` | `string` | yes | - | Application ID |
-| `appSecret` | `string` | yes | - | Application secret |
+| `appSecret` | `string` | for online APIs | - | Application secret. Required for `login` / `validateLicense` / `selfBan`. Omit or pass `""` for `loginFromFile` only; do not ship it in air-gapped binaries. |
 | `publicKey` | `string \| readonly string[]` | yes | - | Base64 Ed25519 public key from the dashboard (3rd positional arg, or `publicKey` in the options object). Accepts one key, an array, or a comma-separated string; the SDK trusts a signature matching **any** entry (key rotation) |
 | `onlineHeartbeat` | `boolean` | no | `false` | Enable online check-ins (periodic `/auth/heartbeat`). When `false`, the app runs through the grace period without contacting AuthForge |
 | `heartbeatMode` | `string` | no | - | **Deprecated.** `"SERVER"` or `"LOCAL"` (case-insensitive); still the 4th positional arg for compatibility. See [Migrating from heartbeatMode](#migrating-from-heartbeatmode) |
@@ -187,6 +187,7 @@ const onFailure = (reason, error) => {
 ## Do NOT
 
 - Do not hardcode the app secret as a plain string literal in source - use environment variables or encrypted config
+- Do not embed the App Secret in air-gapped / `loginFromFile` builds - omit it or pass `""`; verification only needs app id + public key
 - Do not skip the `onFailure` callback - without it, background check failures terminate the process via `process.exit(1)` without your cleanup
 - Do not call `login()` on every app action - call it once at startup; the background checks handle the rest
 - Do not use `heartbeatMode` in new code - it is deprecated; use `onlineHeartbeat: true` when you need online check-ins, or nothing at all for the default grace period

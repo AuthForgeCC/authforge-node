@@ -80,7 +80,7 @@ You can also copy `authforge.mjs` directly into your project if you prefer a sin
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `appId` | `string` | required | Your application ID from the AuthForge dashboard |
-| `appSecret` | `string` | required | Your application secret from the AuthForge dashboard |
+| `appSecret` | `string` | required for online APIs; omit / `""` for `loginFromFile` only | Your application secret from the AuthForge dashboard. Do not ship it in air-gapped binaries. |
 | `publicKey` | `string \| readonly string[]` | required | App Ed25519 public key(s) (base64) from dashboard. Pass one key, an array, or a comma-separated string to trust multiple keys during rotation (see [Key rotation](#key-rotation)). |
 | `onlineHeartbeat` | `boolean` | `false` | Enable online check-ins: periodic `/auth/heartbeat` calls for fast revocation and concurrent-use detection. When `false` (the default), the app runs through the grace period without contacting AuthForge. |
 | `heartbeatMode` | `string` | none | **Deprecated.** `"SERVER"` maps to `onlineHeartbeat: true`; `"LOCAL"` maps to the default. See [Migrating from heartbeatMode](#migrating-from-heartbeatmode). |
@@ -127,7 +127,7 @@ const client = new AuthForgeClient({
 
 ## Offline license files (`.authforge`)
 
-For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts online check-ins.
+For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts online check-ins. Omit `appSecret` so the air-gapped binary does not contain the App Secret.
 
 | | Grace period (default) | Offline license file |
 | --- | --- | --- |
@@ -142,7 +142,6 @@ import { AuthForgeClient } from "@authforgecc/sdk";
 
 const client = new AuthForgeClient({
   appId: "YOUR_APP_ID",
-  appSecret: "YOUR_APP_SECRET", // unused for offline files but still required by the constructor
   publicKey: "YOUR_PUBLIC_KEY",
   onFailure: (reason, error) => console.error(reason, error?.message),
 });

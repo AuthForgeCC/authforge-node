@@ -345,7 +345,7 @@ test("loginFromFile authenticates offline without any network or heartbeat", asy
   const failures = [];
   const client = new AuthForgeClient({
     appId: c.appId,
-    appSecret: "unused-offline",
+    appSecret: "",
     publicKey: c.publicKey,
     hwidOverride: c.hwid,
     onFailure: (reason, error) => failures.push([reason, error?.message]),
@@ -382,7 +382,9 @@ test("offline session: selfBan is a local offline_session error and never posts"
   const posts = [];
   const client = new AuthForgeClient({
     appId: c.appId,
-    appSecret: "unused-offline",
+    // Explicit-license selfBan is an online API; this test covers that
+    // dual-mode path. Offline-only clients omit the secret entirely.
+    appSecret: "online-selfban",
     publicKey: c.publicKey,
     hwidOverride: c.hwid,
     // Closed port: any accidental network call fails loudly instead of hanging.
@@ -417,7 +419,7 @@ test("offline session: heartbeat and grace entry points are no-ops", async () =>
   const c = lifetimeCase(vectors);
   const client = new AuthForgeClient({
     appId: c.appId,
-    appSecret: "unused-offline",
+    appSecret: "",
     publicKey: c.publicKey,
     hwidOverride: c.hwid,
     onlineHeartbeat: true,
@@ -450,7 +452,7 @@ test("loginFromFile rejects bad signature, wrong key, expired and HWID mismatch 
     const failures = [];
     const client = new AuthForgeClient({
       appId: good.appId,
-      appSecret: "unused-offline",
+      appSecret: "",
       publicKey: good.publicKey,
       hwidOverride: good.hwid,
       onFailure: (reason, error) => failures.push([reason, error?.message]),
@@ -503,7 +505,7 @@ test("loginFromFile reads a file from disk and client.verifyLicenseFile is side-
   try {
     const client = new AuthForgeClient({
       appId: c.appId,
-      appSecret: "unused-offline",
+      appSecret: "",
       publicKey: c.publicKey,
       hwidOverride: c.hwid,
       onFailure: () => {},
@@ -516,4 +518,21 @@ test("loginFromFile reads a file from disk and client.verifyLicenseFile is side-
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("offline-only client may omit appSecret; login still requires it", async () => {
+  const vectors = await readOfflineVectors();
+  const c = lifetimeCase(vectors);
+  const client = new AuthForgeClient({
+    appId: c.appId,
+    publicKey: c.publicKey,
+    hwidOverride: c.hwid,
+    onFailure: () => {},
+  });
+  assert.equal(client.appSecret, "");
+  assert.equal(client.loginFromFile(c.file), true);
+  client.logout();
+  await assert.rejects(client.login("XXXX-XXXX-XXXX-XXXX"), {
+    message: "appSecret is required for online APIs; omit it only when using loginFromFile",
+  });
 });

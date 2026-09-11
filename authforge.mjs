@@ -340,8 +340,12 @@ export class AuthForgeClient {
     if (!appId || typeof appId !== "string") {
       throw new Error("appId must be a non-empty string");
     }
-    if (!appSecret || typeof appSecret !== "string") {
-      throw new Error("appSecret must be a non-empty string");
+    // Empty/omitted is valid for offline-only clients (loginFromFile).
+    // Online APIs (login, validateLicense, selfBan) still require a secret.
+    if (appSecret == null || appSecret === undefined) {
+      appSecret = "";
+    } else if (typeof appSecret !== "string") {
+      throw new Error("appSecret must be a string or omitted");
     }
     const publicKeyList = normalizePublicKeyList(publicKey);
     if (publicKeyList.length === 0) {
@@ -534,10 +538,19 @@ export class AuthForgeClient {
     }
   }
 
+  _requireAppSecret() {
+    if (!this.appSecret) {
+      throw new Error(
+        "appSecret is required for online APIs; omit it only when using loginFromFile",
+      );
+    }
+  }
+
   async login(licenseKey) {
     if (!licenseKey || typeof licenseKey !== "string") {
       throw new Error("licenseKey must be a non-empty string");
     }
+    this._requireAppSecret();
     try {
       await this._validateAndStore(licenseKey);
       this._startHeartbeatOnce();
@@ -594,6 +607,7 @@ export class AuthForgeClient {
     if (!licenseKey) {
       throw new Error("missing_license_key");
     }
+    this._requireAppSecret();
     const body = {
       appId: this.appId,
       appSecret: this.appSecret,
@@ -760,6 +774,7 @@ export class AuthForgeClient {
     if (!licenseKey || typeof licenseKey !== "string") {
       throw new Error("licenseKey must be a non-empty string");
     }
+    this._requireAppSecret();
     try {
       const body = {
         appId: this.appId,

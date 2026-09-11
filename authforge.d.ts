@@ -10,7 +10,12 @@ export interface VariableMap {
 
 export interface AuthForgeClientOptions {
   appId: string;
-  appSecret: string;
+  /**
+   * Required for online APIs (`login`, `validateLicense`, `selfBan`).
+   * Omit, or pass `""` / `null`, for offline-only clients (`loginFromFile`).
+   * Air-gapped builds should not ship the App Secret.
+   */
+  appSecret?: string | null;
   /**
    * Trusted Ed25519 public key(s). Pass a single base64 string for the common
    * case, or an array (current key first, previous key(s) after) to remain
@@ -158,7 +163,7 @@ export declare class AuthForgeClient {
   constructor(options: AuthForgeClientOptions);
   constructor(
     appId: string,
-    appSecret: string,
+    appSecret: string | null | undefined,
     publicKey: string | readonly string[],
     heartbeatMode?: string,
     heartbeatInterval?: number,
