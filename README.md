@@ -10,6 +10,8 @@ Official Node.js SDK for [AuthForge](https://authforge.cc): credit-based license
 2. **Grace period (default)**: the app keeps running on that signed session without contacting AuthForge. The SDK periodically re-verifies the signature and expiry locally and fails once the TTL expires. The grace period equals the session TTL: default 24h, and the server clamps requests to 1h to 7d (`ttlSeconds`).
 3. **Online check-ins (optional)**: set `onlineHeartbeat: true` to have the SDK call `POST /auth/heartbeat` every `heartbeatInterval` seconds for fast revocation and concurrent-use detection.
 
+Separately, for machines that can **never** reach the internet, an operator can mint a signed **offline license file (`.authforge`)** in the AuthForge dashboard or Developer API. The SDK verifies it locally with your app public key: see [Offline license files](#offline-license-files-authforge).
+
 ## Features
 
 Everything in this list ships in `authforge.mjs` today:
@@ -22,6 +24,7 @@ Everything in this list ships in `authforge.mjs` today:
 - **`hwidOverride`**: bind to any identity instead of the machine (for example `tg:<id>`, `discord:<id>`).
 - **Seat enforcement**: the server binds each HWID into a license's free slots up to `maxHwidSlots`; `hwidCount` / `maxHwidSlots` are surfaced on the result. A shared (unlimited-seat) key skips per-device binding.
 - **Grace period by default, optional online check-ins** (see [Grace period and online check-ins](#grace-period-and-online-check-ins)).
+- **Offline license files (`.authforge`)**: `loginFromFile()` / `verifyLicenseFile()` verify a cloud-minted, Ed25519-signed file with zero network access for air-gapped machines.
 - **Self-ban** (`selfBan()`) for anti-tamper response, both pre-session and post-session.
 - **Configurable grace period** (`ttlSeconds`) with server-side clamping to `[3600, 604800]`.
 - **App variables / license variables** for feature flags and tiered licensing.
@@ -122,6 +125,44 @@ const client = new AuthForgeClient({
 
 **Online check-ins (`onlineHeartbeat: true`)**: the SDK calls `/auth/heartbeat` every `heartbeatInterval` seconds with a fresh nonce, verifies signature + nonce, and triggers failure on invalid session state. Use this when you need fast revocation or concurrent-use detection.
 
+## Offline license files (`.authforge`)
+
+For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts online check-ins.
+
+| | Grace period (default) | Offline license file |
+| --- | --- | --- |
+| Needs network | Once, at `login()` | Never on the end machine |
+| What is verified | Signed *session* from `/auth/validate` | Signed *document* minted in the cloud |
+| Lifetime | Session TTL: 1h to 7d | Operator-chosen expiry or lifetime (perpetual licenses only) |
+| Revocation | Picked up at the next online validate / check-in | **Not** reachable: the file stays valid until its own expiry |
+| Cost | 1 credit per `login()` | 1 credit per mint; verifying is free |
+
+```js
+import { AuthForgeClient } from "@authforgecc/sdk";
+
+const client = new AuthForgeClient({
+  appId: "YOUR_APP_ID",
+  appSecret: "YOUR_APP_SECRET", // unused for offline files but still required by the constructor
+  publicKey: "YOUR_PUBLIC_KEY",
+  onFailure: (reason, error) => console.error(reason, error?.message),
+});
+
+// 1. The customer sends you this value so you can bind the file to their machine:
+console.log("HWID:", client.getHwid());
+
+// 2. Later, authorize from the minted file (path or armored text). No network.
+if (client.loginFromFile("./license.authforge")) {
+  console.log("Offline license OK until", client.getOfflineLicense().expiresAt ?? "forever");
+  console.log(client.getLicenseVariables());
+}
+```
+
+Collect the HWID from the same SDK build that will load the file: fingerprints are not portable across SDKs or languages. After `loginFromFile()`, `getSessionKind()` returns `"offline"` (`"online"` after `login()`, `null` when logged out).
+
+`verifyLicenseFile()` (module export and client method) performs the same checks without touching client state. Failure codes, in check order: `bad_armor`, `bad_signature`, `unsupported_version`, `malformed_payload`, `wrong_app`, `expired`, `hwid_mismatch`. `loginFromFile()` reports them through `onFailure("offline_login_failed", error)` and returns `false`; it never calls `process.exit`.
+
+File format (version 1): PEM-style armor with informational headers, a base64 JSON payload (`v`, `appId`, `licenseKey`, `jti`, `kid`, `issuedAt`, `expiresAt`, `hwid` policy, optional label/variable snapshots) and a detached Ed25519 signature over the UTF-8 bytes of the base64 payload string - the same contract as `/auth/validate`. See `offline_license_vectors.json` for conformance vectors.
+
 ## Migrating from heartbeatMode
 
 `heartbeatMode` is deprecated. It still works, but constructing a client with it emits a `DeprecationWarning`.
@@ -156,6 +197,11 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 | `login(licenseKey)` | `Promise<boolean>` | Activates online: validates the key and stores the signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
 | `validateLicense(licenseKey)` | `Promise<ValidateLicenseResult>` | Same `/auth/validate` + signatures as `login`; does not store session or start background checks; failures return `{ valid: false }` and never call `onFailure` or `process.exit` |
 | `selfBan(options?)` | `Promise<Record<string, unknown>>` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
+| `loginFromFile(pathOrText)` | `boolean` | Authorizes from an offline `.authforge` file with no network; never starts background checks; failures go to `onFailure("offline_login_failed", …)` |
+| `verifyLicenseFile(pathOrText, options?)` | `VerifyLicenseFileResult` | Verifies a `.authforge` file with this client's app id / keys / HWID without changing state |
+| `getOfflineLicense()` | `OfflineLicenseSummary \| null` | Metadata of the offline file in use (`jti`, `expiresAt`, `hwidPolicy`, …) |
+| `getSessionKind()` | `"online" \| "offline" \| null` | Which kind of session the client holds (`null` when logged out) |
+| `getHwid()` | `string` | The HWID this client sends (or `hwidOverride`); customers share it to receive a bound file |
 | `logout()` | `void` | Stops background checks and clears all session/auth state |
 | `isAuthenticated()` | `boolean` | `true` when an active authenticated session exists |
 | `getSessionData()` | `Record<string, unknown> \| null` | Full decoded payload map |
@@ -219,6 +265,7 @@ await client.selfBan({
 - Uses post-session mode when `sessionToken` is available (`options.sessionToken` or current SDK session).
 - Falls back to pre-session mode with `licenseKey` + nonce + app secret.
 - In pre-session mode, revoke is always disabled client-side to avoid unsafe key revocations.
+- Not available after `loginFromFile()`: offline sessions have no server session, so `selfBan()` with no explicit `licenseKey` / `sessionToken` rejects with `offline_session` without contacting the server.
 
 ## How It Works
 
@@ -245,7 +292,7 @@ For non-device identities (for example Telegram users), pass `hwidOverride` such
 
 ## Test Vectors
 
-The shared `test_vectors.json` file validates cross-language Ed25519 verification behavior.
+The shared `test_vectors.json` file validates cross-language Ed25519 verification behavior. `offline_license_vectors.json` (generated by `generate_offline_vectors.mjs` from a fixed test seed) is the cross-SDK conformance suite for `.authforge` offline license files: good files plus the `bad_signature`, wrong key, `wrong_app`, `expired`, `hwid_mismatch`, `unsupported_version` and `bad_armor` rejects.
 
 ## Requirements
 

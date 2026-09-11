@@ -1,4 +1,5 @@
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
+import { readFileSync } from "node:fs";
 import https from "node:https";
 import os from "node:os";
 import { clearInterval as clearIntervalTimer, setInterval as setIntervalTimer } from "node:timers";
@@ -111,6 +112,161 @@ export function verifyPayloadSignatureEd25519(payloadBase64, signatureBase64, pu
     }
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Offline license files (`.authforge`)
+//
+// A cloud-minted, Ed25519-signed document for machines that never phone home.
+// This is a SEPARATE mode from the grace period: the grace period continues a
+// signed session after one online activation, while an offline file is
+// verified locally with only the app public key and the machine HWID. Nothing
+// here performs network I/O or starts online check-ins.
+// ---------------------------------------------------------------------------
+
+const OFFLINE_LICENSE_FILE_VERSION = 1;
+const OFFLINE_BEGIN_LICENSE = "-----BEGIN AUTHFORGE LICENSE-----";
+const OFFLINE_END_LICENSE = "-----END AUTHFORGE LICENSE-----";
+const OFFLINE_BEGIN_SIGNATURE = "-----BEGIN AUTHFORGE SIGNATURE-----";
+const OFFLINE_END_SIGNATURE = "-----END AUTHFORGE SIGNATURE-----";
+const OFFLINE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+export const offlineLicenseErrors = [
+  "bad_armor",
+  "bad_signature",
+  "unsupported_version",
+  "malformed_payload",
+  "wrong_app",
+  "expired",
+  "hwid_mismatch",
+];
+
+/**
+ * Parse armored `.authforge` text into `{ headers, payloadBase64, signatureBase64 }`
+ * or `null` when the armor is malformed. Tolerates CRLF, a UTF-8 BOM, any
+ * re-wrapping of the base64 body and text before/after the armor.
+ * `payloadBase64` is exactly the string the signature covers.
+ */
+export function parseLicenseFile(text) {
+  if (typeof text !== "string") return null;
+  const lines = text.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").split("\n");
+  const beginIdx = lines.findIndex((l) => l.trim() === OFFLINE_BEGIN_LICENSE);
+  if (beginIdx === -1) return null;
+  const endIdx = lines.findIndex((l, i) => i > beginIdx && l.trim() === OFFLINE_END_LICENSE);
+  if (endIdx === -1) return null;
+  const sigBeginIdx = lines.findIndex((l, i) => i > endIdx && l.trim() === OFFLINE_BEGIN_SIGNATURE);
+  if (sigBeginIdx === -1) return null;
+  const sigEndIdx = lines.findIndex((l, i) => i > sigBeginIdx && l.trim() === OFFLINE_END_SIGNATURE);
+  if (sigEndIdx === -1) return null;
+
+  const block = lines.slice(beginIdx + 1, endIdx);
+  const blankIdx = block.findIndex((l) => l.trim() === "");
+  if (blankIdx === -1) return null;
+  const headers = {};
+  for (const raw of block.slice(0, blankIdx)) {
+    const line = raw.trim();
+    const colon = line.indexOf(":");
+    if (colon <= 0) return null;
+    headers[line.slice(0, colon).trim()] = line.slice(colon + 1).trim();
+  }
+  const payloadBase64 = block.slice(blankIdx + 1).join("").replace(/\s+/g, "");
+  const signatureBase64 = lines.slice(sigBeginIdx + 1, sigEndIdx).join("").replace(/\s+/g, "");
+  if (!payloadBase64 || !OFFLINE_BASE64_RE.test(payloadBase64)) return null;
+  if (!signatureBase64 || !OFFLINE_BASE64_RE.test(signatureBase64)) return null;
+  return { headers, payloadBase64, signatureBase64 };
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isStringArray(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((v) => typeof v === "string" && v.length > 0);
+}
+
+function validateOfflinePayloadShape(payload) {
+  if (payload.typ !== "authforge-license") return false;
+  for (const field of ["appId", "licenseKey", "jti", "kid", "issuedAt"]) {
+    if (typeof payload[field] !== "string" || payload[field].length === 0) return false;
+  }
+  if (payload.expiresAt !== null && (typeof payload.expiresAt !== "string" || payload.expiresAt.length === 0)) {
+    return false;
+  }
+  if (!isPlainObject(payload.hwid)) return false;
+  if (payload.hwid.mode === "bound") {
+    if (!isStringArray(payload.hwid.hwids)) return false;
+  } else if (payload.hwid.mode !== "any") {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Verify an offline `.authforge` license file with NO network access.
+ *
+ * Check order (fixed across every SDK): bad_armor -> bad_signature ->
+ * unsupported_version -> malformed_payload -> wrong_app -> expired ->
+ * hwid_mismatch. The signature is checked before the payload JSON is
+ * decoded so a forged file never reaches the parser.
+ *
+ * @param {object} params
+ * @param {string} params.file      Armored file text.
+ * @param {string} params.appId     Your app id; must match the payload.
+ * @param {string|readonly string[]} params.publicKey  Trusted public key(s).
+ * @param {string|null} [params.hwid]  Local HWID (required for bound files).
+ * @param {Date|number} [params.now]   Clock override (tests).
+ * @returns {{ok: true, license: object, payloadBase64: string, signatureBase64: string} | {ok: false, error: string}}
+ */
+export function verifyLicenseFile({ file, appId, publicKey, hwid = null, now = undefined }) {
+  const parsed = parseLicenseFile(file);
+  if (!parsed) return { ok: false, error: "bad_armor" };
+
+  if (!verifyPayloadSignatureEd25519(parsed.payloadBase64, parsed.signatureBase64, publicKey)) {
+    return { ok: false, error: "bad_signature" };
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(parsed.payloadBase64, "base64").toString("utf8"));
+  } catch {
+    return { ok: false, error: "malformed_payload" };
+  }
+  if (!isPlainObject(payload)) return { ok: false, error: "malformed_payload" };
+  if (payload.v !== OFFLINE_LICENSE_FILE_VERSION) return { ok: false, error: "unsupported_version" };
+  if (!validateOfflinePayloadShape(payload)) return { ok: false, error: "malformed_payload" };
+
+  if (payload.appId !== appId) return { ok: false, error: "wrong_app" };
+
+  const nowMs = now instanceof Date ? now.getTime() : typeof now === "number" ? now : Date.now();
+  if (payload.expiresAt !== null) {
+    const exp = new Date(payload.expiresAt).getTime();
+    if (!Number.isFinite(exp) || exp <= nowMs) return { ok: false, error: "expired" };
+  }
+
+  if (payload.hwid.mode === "bound") {
+    const local = typeof hwid === "string" ? hwid.trim() : "";
+    if (!local || !payload.hwid.hwids.includes(local)) return { ok: false, error: "hwid_mismatch" };
+  }
+
+  return {
+    ok: true,
+    license: {
+      appId: payload.appId,
+      licenseKey: payload.licenseKey,
+      jti: payload.jti,
+      keyId: payload.kid,
+      issuedAt: payload.issuedAt,
+      expiresAt: payload.expiresAt,
+      hwidPolicy: payload.hwid.mode === "bound" ? { mode: "bound", hwids: [...payload.hwid.hwids] } : { mode: "any" },
+      ...(typeof payload.label === "string" ? { label: payload.label } : {}),
+      ...(Object.hasOwn(payload, "licenseExpiresAt") ? { licenseExpiresAt: payload.licenseExpiresAt ?? null } : {}),
+      licenseVariables: cloneObject(payload.licenseVariables),
+      appVariables: cloneObject(payload.appVariables),
+      payload: { ...payload },
+    },
+    payloadBase64: parsed.payloadBase64,
+    signatureBase64: parsed.signatureBase64,
+  };
 }
 
 function postJson(urlText, body, timeoutSeconds) {
@@ -235,6 +391,10 @@ export class AuthForgeClient {
 
     this._licenseKey = null;
     this._sessionToken = null;
+    // "online" after login()/validate, "offline" after loginFromFile(), null
+    // when logged out. Drives isAuthenticated(), selfBan() and the heartbeat
+    // guard so the two modes can never be confused for each other.
+    this._sessionKind = null;
     this._sessionExpiresIn = null;
     this._lastNonce = null;
     this._rawPayloadB64 = null;
@@ -244,7 +404,134 @@ export class AuthForgeClient {
     this._appVariables = null;
     this._licenseVariables = null;
     this._authenticated = false;
+    this._offlineLicense = null;
     this._hwid = this._resolveHwid(hwidOverride);
+  }
+
+  /** `"online"`, `"offline"` or `null` when not authenticated. */
+  getSessionKind() {
+    return this._sessionKind;
+  }
+
+  /**
+   * The HWID this client sends to AuthForge (or `hwidOverride` if set).
+   * Customers on air-gapped machines report this value to the operator so an
+   * offline `.authforge` file can be bound to it.
+   */
+  getHwid() {
+    return this._hwid;
+  }
+
+  /**
+   * Authorize from a cloud-minted offline license file (`.authforge`) with NO
+   * network access. Accepts a filesystem path or the armored text itself.
+   *
+   * On success the client is authenticated (`isAuthenticated()`,
+   * `getSessionData()`, `getAppVariables()`, `getLicenseVariables()` work) and
+   * `getOfflineLicense()` describes the file. No grace-period timer and no
+   * online check-ins are started - the file's own `expiresAt` is the only
+   * clock. Online `login()` is untouched.
+   *
+   * Returns `true`/`false`; failures are reported through `onFailure` with
+   * reason `offline_login_failed` (never `process.exit`, unlike `login()`
+   * without a callback - an unreadable file should not kill an air-gapped
+   * process without a chance to show the user why).
+   */
+  loginFromFile(pathOrText) {
+    let text;
+    try {
+      text = this._readLicenseFileInput(pathOrText);
+    } catch (error) {
+      this._failSoft("offline_login_failed", error);
+      return false;
+    }
+    const result = verifyLicenseFile({
+      file: text,
+      appId: this.appId,
+      publicKey: this.publicKeys,
+      hwid: this._hwid,
+    });
+    if (!result.ok) {
+      this._failSoft("offline_login_failed", new Error(result.error));
+      return false;
+    }
+    this._applyOfflineLicense(result);
+    return true;
+  }
+
+  /**
+   * Verify a `.authforge` file with this client's app id, public key(s) and
+   * HWID, without touching session state. Pure; never throws for bad input.
+   */
+  verifyLicenseFile(pathOrText, options = {}) {
+    let text;
+    try {
+      text = this._readLicenseFileInput(pathOrText);
+    } catch (error) {
+      return { ok: false, error: `read_error: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    return verifyLicenseFile({
+      file: text,
+      appId: this.appId,
+      publicKey: this.publicKeys,
+      hwid: this._hwid,
+      now: options.now,
+    });
+  }
+
+  /** Details of the offline file the client authenticated with, or `null`. */
+  getOfflineLicense() {
+    return this._offlineLicense ? { ...this._offlineLicense } : null;
+  }
+
+  _readLicenseFileInput(pathOrText) {
+    if (typeof pathOrText !== "string" || pathOrText.length === 0) {
+      throw new Error("license file must be a path or the armored text");
+    }
+    if (pathOrText.includes(OFFLINE_BEGIN_LICENSE)) {
+      return pathOrText;
+    }
+    return readFileSync(pathOrText, "utf8");
+  }
+
+  _applyOfflineLicense(result) {
+    // Stop any online session first so the two modes never overlap.
+    this.logout();
+    const { license } = result;
+    this._licenseKey = license.licenseKey;
+    // Offline files carry no server session token. The explicit session kind
+    // (not a token sentinel) is what makes isAuthenticated() true and keeps
+    // selfBan()/heartbeats from ever contacting the server for this session.
+    this._sessionToken = null;
+    this._sessionKind = "offline";
+    this._sessionExpiresIn = license.expiresAt ? Math.floor(new Date(license.expiresAt).getTime() / 1000) : null;
+    this._rawPayloadB64 = result.payloadBase64;
+    this._signature = result.signatureBase64;
+    this._keyId = license.keyId;
+    this._sessionData = { ...license.payload };
+    this._appVariables = license.appVariables;
+    this._licenseVariables = license.licenseVariables;
+    this._offlineLicense = {
+      licenseKey: license.licenseKey,
+      jti: license.jti,
+      keyId: license.keyId,
+      issuedAt: license.issuedAt,
+      expiresAt: license.expiresAt,
+      hwidPolicy: license.hwidPolicy,
+      ...(license.label !== undefined ? { label: license.label } : {}),
+      ...(license.licenseExpiresAt !== undefined ? { licenseExpiresAt: license.licenseExpiresAt } : {}),
+    };
+    this._authenticated = true;
+  }
+
+  _failSoft(reason, error) {
+    if (this.onFailure) {
+      try {
+        this.onFailure(reason, error);
+      } catch {
+        // Caller's callback threw; nothing else to do offline.
+      }
+    }
   }
 
   async login(licenseKey) {
@@ -273,6 +560,18 @@ export class AuthForgeClient {
       typeof opts.sessionToken === "string" && opts.sessionToken.trim()
         ? opts.sessionToken.trim()
         : null;
+    const licenseKeyOption =
+      typeof opts.licenseKey === "string" && opts.licenseKey.trim()
+        ? opts.licenseKey.trim()
+        : null;
+
+    // An offline session has no server session and must never phone home on
+    // its own. Callers who pass an explicit licenseKey/sessionToken are
+    // asking about a *different* credential and still get the normal paths.
+    if (this._sessionKind === "offline" && !sessionTokenOption && !licenseKeyOption) {
+      throw new Error("offline_session");
+    }
+
     const sessionToken = sessionTokenOption || this._sessionToken;
 
     if (sessionToken) {
@@ -291,10 +590,6 @@ export class AuthForgeClient {
       return responseObject;
     }
 
-    const licenseKeyOption =
-      typeof opts.licenseKey === "string" && opts.licenseKey.trim()
-        ? opts.licenseKey.trim()
-        : null;
     const licenseKey = licenseKeyOption || this._licenseKey;
     if (!licenseKey) {
       throw new Error("missing_license_key");
@@ -325,6 +620,7 @@ export class AuthForgeClient {
 
     this._licenseKey = null;
     this._sessionToken = null;
+    this._sessionKind = null;
     this._sessionExpiresIn = null;
     this._lastNonce = null;
     this._rawPayloadB64 = null;
@@ -334,10 +630,23 @@ export class AuthForgeClient {
     this._appVariables = null;
     this._licenseVariables = null;
     this._authenticated = false;
+    this._offlineLicense = null;
   }
 
   isAuthenticated() {
-    return this._authenticated && Boolean(this._sessionToken);
+    if (!this._authenticated) {
+      return false;
+    }
+    switch (this._sessionKind) {
+      case "online":
+        return Boolean(this._sessionToken);
+      case "offline":
+        return true;
+      case null:
+        return false;
+      default:
+        return false;
+    }
   }
 
   getSessionData() {
@@ -353,7 +662,9 @@ export class AuthForgeClient {
   }
 
   _startHeartbeatOnce() {
-    if (this._heartbeatStarted) {
+    // Offline sessions have no grace period and no online check-ins: the
+    // file's own expiresAt is the only clock. Never start a timer for them.
+    if (this._heartbeatStarted || this._sessionKind === "offline") {
       return;
     }
     this._heartbeatStarted = true;
@@ -365,6 +676,9 @@ export class AuthForgeClient {
   }
 
   async _heartbeatTick() {
+    if (this._sessionKind === "offline") {
+      return;
+    }
     try {
       if (this.onlineHeartbeat) {
         await this._serverHeartbeat();
@@ -558,6 +872,7 @@ export class AuthForgeClient {
       this._licenseKey = licenseKey;
     }
     this._sessionToken = parsed.sessionToken;
+    this._sessionKind = "online";
     this._sessionExpiresIn = parsed.expiresIn;
     this._lastNonce = expectedNonce;
     this._rawPayloadB64 = parsed.rawPayloadB64;

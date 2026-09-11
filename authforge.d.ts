@@ -78,6 +78,82 @@ export declare function verifyPayloadSignatureEd25519(
   publicKey: string | readonly string[],
 ): boolean;
 
+// ---------------------------------------------------------------------------
+// Offline license files (`.authforge`) - separate mode from the grace period.
+// ---------------------------------------------------------------------------
+
+export type OfflineHwidPolicy = { mode: "bound"; hwids: string[] } | { mode: "any" };
+
+export type OfflineLicenseError =
+  | "bad_armor"
+  | "bad_signature"
+  | "unsupported_version"
+  | "malformed_payload"
+  | "wrong_app"
+  | "expired"
+  | "hwid_mismatch";
+
+export interface OfflineLicense {
+  appId: string;
+  licenseKey: string;
+  /** Unique id of this minted file. */
+  jti: string;
+  /** App signing key id that signed the file. */
+  keyId: string;
+  issuedAt: string;
+  /** ISO 8601 file expiry, or `null` for a lifetime file. */
+  expiresAt: string | null;
+  hwidPolicy: OfflineHwidPolicy;
+  label?: string;
+  licenseExpiresAt?: string | null;
+  licenseVariables: VariableMap | null;
+  appVariables: VariableMap | null;
+  /** Full decoded payload (forward-compatible: unknown fields preserved). */
+  payload: SessionData;
+}
+
+export type VerifyLicenseFileResult =
+  | { ok: true; license: OfflineLicense; payloadBase64: string; signatureBase64: string }
+  | { ok: false; error: OfflineLicenseError | string };
+
+export interface ParsedLicenseFile {
+  headers: Record<string, string>;
+  payloadBase64: string;
+  signatureBase64: string;
+}
+
+/** Parse armored `.authforge` text; `null` when the armor is malformed. */
+export declare function parseLicenseFile(text: string): ParsedLicenseFile | null;
+
+/**
+ * Verify a `.authforge` file locally (no network). Check order:
+ * bad_armor -> bad_signature -> unsupported_version -> malformed_payload ->
+ * wrong_app -> expired -> hwid_mismatch.
+ */
+export declare function verifyLicenseFile(params: {
+  file: string;
+  appId: string;
+  publicKey: string | readonly string[];
+  hwid?: string | null;
+  now?: Date | number;
+}): VerifyLicenseFileResult;
+
+export declare const offlineLicenseErrors: readonly OfflineLicenseError[];
+
+/** How the client authenticated: server session (`login`) or local file (`loginFromFile`). */
+export type SessionKind = "online" | "offline";
+
+export interface OfflineLicenseSummary {
+  licenseKey: string;
+  jti: string;
+  keyId: string;
+  issuedAt: string;
+  expiresAt: string | null;
+  hwidPolicy: OfflineHwidPolicy;
+  label?: string;
+  licenseExpiresAt?: string | null;
+}
+
 export declare class AuthForgeClient {
   constructor(options: AuthForgeClientOptions);
   constructor(
@@ -118,8 +194,29 @@ export declare class AuthForgeClient {
    * Same cryptographic validation as login, without session mutation or heartbeats.
    */
   validateLicense(licenseKey: string): Promise<ValidateLicenseResult>;
+  /**
+   * Authorize from an offline `.authforge` license file (path or armored text)
+   * with no network access. Never starts the grace-period timer or online
+   * check-ins. Failures call `onFailure("offline_login_failed", error)` and
+   * return `false` (never `process.exit`).
+   */
+  loginFromFile(pathOrText: string): boolean;
+  /** Verify a `.authforge` file with this client's app id / keys / HWID; no state change. */
+  verifyLicenseFile(pathOrText: string, options?: { now?: Date | number }): VerifyLicenseFileResult;
+  /** Offline file the client authenticated with, or `null`. */
+  getOfflineLicense(): OfflineLicenseSummary | null;
+  /** HWID sent to AuthForge (or `hwidOverride`). Share it with the operator to get a bound file. */
+  getHwid(): string;
   logout(): void;
+  /** `true` for an online session (login) or an offline one (loginFromFile). */
   isAuthenticated(): boolean;
+  /**
+   * Which kind of session the client holds: `"online"` after `login()`,
+   * `"offline"` after `loginFromFile()`, `null` when logged out. `selfBan()`
+   * without an explicit `licenseKey`/`sessionToken` throws `offline_session`
+   * on an offline session and never contacts the server.
+   */
+  getSessionKind(): SessionKind | null;
   getSessionData(): SessionData | null;
   getAppVariables(): VariableMap | null;
   getLicenseVariables(): VariableMap | null;
