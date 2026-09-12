@@ -542,6 +542,14 @@ test("offline-only client may omit appSecret; login still requires it", async ()
 // Activation requests (`.authforge-request`)
 // ---------------------------------------------------------------------------
 
+test("SDK_TAG version matches package.json", async () => {
+  const src = await readFile(path.join(here, "authforge.mjs"), "utf8");
+  const pkg = JSON.parse(await readFile(path.join(here, "package.json"), "utf8"));
+  const match = src.match(/^const SDK_TAG = "node\/([^"]+)";$/m);
+  assert.ok(match, "SDK_TAG constant not found");
+  assert.equal(match[1], pkg.version);
+});
+
 test("createActivationRequest matches committed vectors for the same inputs", async () => {
   const raw = await readFile(path.join(here, "activation_request_vectors.json"), "utf8");
   const vectors = JSON.parse(raw);

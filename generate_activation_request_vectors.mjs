@@ -23,7 +23,10 @@ const FULL_INPUTS = {
   createdAt: CREATED_AT,
   machineName: "dev-box",
   os: "Windows 11",
-  sdk: "python/1.2.1",
+  // Frozen fixture that pins the *encoding*, not the live SDK tag. Do not
+  // wire this to SDK_TAG / package.json: a version bump must not invalidate
+  // the golden file in seven repos.
+  sdk: "python/0.0.0-vectors",
   licenseKey: "TEST-KEY0-0000-0000",
 };
 
