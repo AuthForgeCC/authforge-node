@@ -146,8 +146,8 @@ const client = new AuthForgeClient({
   onFailure: (reason, error) => console.error(reason, error?.message),
 });
 
-// 1. The customer sends you this value so you can bind the file to their machine:
-console.log("HWID:", client.getHwid());
+# 1. Write an activation request the operator drops into the mint dialog:
+client.writeActivationRequest("./machine.authforge-request");
 
 // 2. Later, authorize from the minted file (path or armored text). No network.
 if (client.loginFromFile("./license.authforge")) {
@@ -201,6 +201,8 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 | `getOfflineLicense()` | `OfflineLicenseSummary \| null` | Metadata of the offline file in use (`jti`, `expiresAt`, `hwidPolicy`, …) |
 | `getSessionKind()` | `"online" \| "offline" \| null` | Which kind of session the client holds (`null` when logged out) |
 | `getHwid()` | `string` | The HWID this client sends (or `hwidOverride`); customers share it to receive a bound file |
+| `createActivationRequest(options?)` | `string` | Unsigned `.authforge-request` for this machine. No network, no secret. Hostname omitted unless `includeMachineName: true` |
+| `writeActivationRequest(path, options?)` | `void` | Writes that file as UTF-8 |
 | `logout()` | `void` | Stops background checks and clears all session/auth state |
 | `isAuthenticated()` | `boolean` | `true` when an active authenticated session exists |
 | `getSessionData()` | `Record<string, unknown> \| null` | Full decoded payload map |

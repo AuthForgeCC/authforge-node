@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   AuthForgeClient,
+  formatActivationRequest,
   parseLicenseFile,
   verifyLicenseFile,
   verifyPayloadSignatureEd25519,
@@ -535,4 +536,75 @@ test("offline-only client may omit appSecret; login still requires it", async ()
   await assert.rejects(client.login("XXXX-XXXX-XXXX-XXXX"), {
     message: "appSecret is required for online APIs; omit it only when using loginFromFile",
   });
+});
+
+// ---------------------------------------------------------------------------
+// Activation requests (`.authforge-request`)
+// ---------------------------------------------------------------------------
+
+test("createActivationRequest matches committed vectors for the same inputs", async () => {
+  const raw = await readFile(path.join(here, "activation_request_vectors.json"), "utf8");
+  const vectors = JSON.parse(raw);
+  const dummyKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  for (const c of vectors.cases) {
+    if (!c.inputs) continue;
+    const client = new AuthForgeClient({
+      appId: c.inputs.appId,
+      publicKey: dummyKey,
+      hwidOverride: c.inputs.hwid,
+    });
+    const got = client.createActivationRequest({
+      createdAt: c.inputs.createdAt,
+      omitOs: !c.inputs.os,
+      omitSdk: !c.inputs.sdk,
+      includeMachineName: Boolean(c.inputs.machineName),
+      machineName: c.inputs.machineName,
+      os: c.inputs.os,
+      sdk: c.inputs.sdk,
+      licenseKey: c.inputs.licenseKey ?? "",
+    });
+    assert.equal(got, c.file, c.name);
+    assert.equal(formatActivationRequest(c.inputs), c.file, `${c.name} formatActivationRequest`);
+  }
+});
+
+test("createActivationRequest works with no app secret and before login", () => {
+  const client = new AuthForgeClient({
+    appId: "test-app",
+    publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    hwidOverride: "testhwid",
+  });
+  const file = client.createActivationRequest({
+    createdAt: "2026-09-11T12:00:00.000Z",
+    omitOs: true,
+    omitSdk: true,
+  });
+  assert.match(file, /BEGIN AUTHFORGE ACTIVATION REQUEST/);
+  assert.equal(file.includes("BEGIN AUTHFORGE LICENSE"), false);
+  assert.equal(file.includes("machineName"), false);
+});
+
+test("writeActivationRequest writes UTF-8 next to the app", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "authforge-request-"));
+  try {
+    const dest = path.join(dir, "machine.authforge-request");
+    const client = new AuthForgeClient({
+      appId: "test-app",
+      publicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      hwidOverride: "testhwid",
+    });
+    client.writeActivationRequest(dest, {
+      createdAt: "2026-09-11T12:00:00.000Z",
+      omitOs: true,
+      omitSdk: true,
+    });
+    const written = await readFile(dest, "utf8");
+    assert.equal(written, client.createActivationRequest({
+      createdAt: "2026-09-11T12:00:00.000Z",
+      omitOs: true,
+      omitSdk: true,
+    }));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

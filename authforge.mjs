@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import https from "node:https";
 import os from "node:os";
 import { clearInterval as clearIntervalTimer, setInterval as setIntervalTimer } from "node:timers";
@@ -130,6 +130,137 @@ const OFFLINE_END_LICENSE = "-----END AUTHFORGE LICENSE-----";
 const OFFLINE_BEGIN_SIGNATURE = "-----BEGIN AUTHFORGE SIGNATURE-----";
 const OFFLINE_END_SIGNATURE = "-----END AUTHFORGE SIGNATURE-----";
 const OFFLINE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const ARMOR_LINE_WIDTH = 64;
+
+// Activation requests (`.authforge-request`): unsigned transport for a HWID so
+// the operator can mint a bound `.authforge` file without the customer pasting
+// a raw string. Distinct markers from BEGIN AUTHFORGE LICENSE. Not signed;
+// the Checksum header is the only integrity check. Keep SDK_TAG in sync with
+// package.json version.
+const ACTIVATION_REQUEST_VERSION = 1;
+const ACTIVATION_REQUEST_TYP = "authforge-activation-request";
+const BEGIN_ACTIVATION_REQUEST = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----";
+const END_ACTIVATION_REQUEST = "-----END AUTHFORGE ACTIVATION REQUEST-----";
+const SDK_TAG = "node/1.2.1";
+const MAX_REQUEST_HWID = 256;
+const MAX_REQUEST_MACHINE_NAME = 128;
+const MAX_REQUEST_OS = 64;
+const MAX_REQUEST_SDK = 64;
+const MAX_REQUEST_LICENSE_KEY = 64;
+
+function clipRequestField(value, max) {
+  if (typeof value !== "string" || value.length === 0) return "";
+  return value.length <= max ? value : value.slice(0, max);
+}
+
+function jsonEscapeRequest(value) {
+  let out = "";
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    const ch = value[i];
+    switch (ch) {
+      case "\\":
+        out += "\\\\";
+        break;
+      case '"':
+        out += '\\"';
+        break;
+      case "\b":
+        out += "\\b";
+        break;
+      case "\f":
+        out += "\\f";
+        break;
+      case "\n":
+        out += "\\n";
+        break;
+      case "\r":
+        out += "\\r";
+        break;
+      case "\t":
+        out += "\\t";
+        break;
+      default:
+        if (code < 0x20) {
+          out += `\\u00${code.toString(16).padStart(2, "0")}`;
+        } else {
+          out += ch;
+        }
+    }
+  }
+  return `"${out}"`;
+}
+
+function wrapArmor64(value) {
+  const lines = [];
+  for (let i = 0; i < value.length; i += ARMOR_LINE_WIDTH) {
+    lines.push(value.slice(i, i + ARMOR_LINE_WIDTH));
+  }
+  return lines.join("\n");
+}
+
+function canonicalActivationRequestJson({ appId, hwid, createdAt, machineName, os: osName, sdk, licenseKey }) {
+  const parts = [
+    `"v":${ACTIVATION_REQUEST_VERSION}`,
+    `"typ":${jsonEscapeRequest(ACTIVATION_REQUEST_TYP)}`,
+    `"appId":${jsonEscapeRequest(appId)}`,
+    `"hwid":${jsonEscapeRequest(clipRequestField(hwid, MAX_REQUEST_HWID))}`,
+    `"createdAt":${jsonEscapeRequest(createdAt)}`,
+  ];
+  if (machineName) parts.push(`"machineName":${jsonEscapeRequest(clipRequestField(machineName, MAX_REQUEST_MACHINE_NAME))}`);
+  if (osName) parts.push(`"os":${jsonEscapeRequest(clipRequestField(osName, MAX_REQUEST_OS))}`);
+  if (sdk) parts.push(`"sdk":${jsonEscapeRequest(clipRequestField(sdk, MAX_REQUEST_SDK))}`);
+  if (licenseKey) parts.push(`"licenseKey":${jsonEscapeRequest(clipRequestField(licenseKey, MAX_REQUEST_LICENSE_KEY))}`);
+  return `{${parts.join(",")}}`;
+}
+
+function detectOsLabel() {
+  switch (process.platform) {
+    case "win32":
+      return clipRequestField(`Windows ${os.release()}`, MAX_REQUEST_OS);
+    case "darwin":
+      return clipRequestField(`macOS ${os.release()}`, MAX_REQUEST_OS);
+    default:
+      return clipRequestField(`${os.type()} ${os.release()}`, MAX_REQUEST_OS);
+  }
+}
+
+/**
+ * Build armored `.authforge-request` text from explicit fields. Exported so
+ * the vector generator and tests share one encoder with the client.
+ */
+export function formatActivationRequest({
+  appId,
+  hwid,
+  createdAt,
+  machineName,
+  os: osName,
+  sdk,
+  licenseKey,
+}) {
+  const json = canonicalActivationRequestJson({
+    appId,
+    hwid,
+    createdAt,
+    machineName,
+    os: osName,
+    sdk,
+    licenseKey,
+  });
+  const payloadBase64 = Buffer.from(json, "utf8").toString("base64");
+  const checksum = createHash("sha256").update(payloadBase64, "utf8").digest("hex").slice(0, 16);
+  const clean = (value) => String(value).replace(/[\r\n]+/g, " ").trim();
+  return [
+    BEGIN_ACTIVATION_REQUEST,
+    `Version: ${ACTIVATION_REQUEST_VERSION}`,
+    `App-Id: ${clean(appId)}`,
+    `Checksum: ${checksum}`,
+    "",
+    wrapArmor64(payloadBase64),
+    END_ACTIVATION_REQUEST,
+    "",
+  ].join("\n");
+}
 
 export const offlineLicenseErrors = [
   "bad_armor",
@@ -424,6 +555,42 @@ export class AuthForgeClient {
    */
   getHwid() {
     return this._hwid;
+  }
+
+  /**
+   * Build an activation request (`.authforge-request`) for this machine.
+   * No network, no session, no app secret. The HWID is the same value
+   * `login()` / `loginFromFile()` use. `machineName` is omitted unless
+   * `includeMachineName` is true (hostnames are often a person's name).
+   *
+   * @param {{ includeMachineName?: boolean, machineName?: string, os?: string, omitOs?: boolean, sdk?: string, omitSdk?: boolean, licenseKey?: string, createdAt?: string }} [options]
+   */
+  createActivationRequest(options = {}) {
+    const createdAt = options.createdAt ?? new Date().toISOString();
+    const machineName = options.includeMachineName
+      ? options.machineName || os.hostname()
+      : undefined;
+    const osName = options.omitOs ? undefined : (options.os ?? detectOsLabel());
+    const sdk = options.omitSdk ? undefined : (options.sdk ?? SDK_TAG);
+    const licenseKey =
+      options.licenseKey !== undefined ? options.licenseKey : this._licenseKey || undefined;
+    return formatActivationRequest({
+      appId: this.appId,
+      hwid: this._hwid,
+      createdAt,
+      machineName,
+      os: osName,
+      sdk,
+      licenseKey,
+    });
+  }
+
+  /**
+   * Write an activation request to `path` (UTF-8). Same options as
+   * {@link createActivationRequest}.
+   */
+  writeActivationRequest(filePath, options = {}) {
+    writeFileSync(filePath, this.createActivationRequest(options), "utf8");
   }
 
   /**

@@ -14,7 +14,7 @@ After activation the client follows one of two policies:
 
 If the license is revoked or expired, the background check fails and you handle it (typically exit the app).
 
-There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `loginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (omit `appSecret`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login()` + grace period.
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `loginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (omit `appSecret`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login()` + grace period. To collect the HWID for a bound file, write an **activation request** (`.authforge-request`) with `createActivationRequest` / `writeActivationRequest`. It is not a license, is not signed, and does not mint anything. Prefer it over printing the raw HWID.
 
 ## Billing model (so you can pick sensible intervals)
 
@@ -121,6 +121,8 @@ The client exposes `onlineHeartbeat` (boolean, the effective policy) and keeps a
 | `getOfflineLicense()` | `OfflineLicenseSummary \| null` | `jti`, `expiresAt`, `hwidPolicy`, … of the offline file in use |
 | `getSessionKind()` | `"online" \| "offline" \| null` | Kind of session the client holds; `null` when logged out |
 | `getHwid()` | `string` | HWID this client sends; the customer reports it so the operator can mint a bound file |
+| `createActivationRequest(options?)` | `string` | Unsigned `.authforge-request` for this machine. No network, no secret, callable before `login()`. Hostname omitted unless `includeMachineName: true` |
+| `writeActivationRequest(path, options?)` | `void` | Writes that file as UTF-8 |
 | `logout()` | `void` | Stops background checks and clears session state |
 | `isAuthenticated()` | `boolean` | Whether a session token is present and marked authenticated |
 | `getSessionData()` | `Record<string, unknown> \| null` | Decoded signed payload map |

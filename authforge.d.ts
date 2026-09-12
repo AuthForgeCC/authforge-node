@@ -130,6 +130,32 @@ export interface ParsedLicenseFile {
 /** Parse armored `.authforge` text; `null` when the armor is malformed. */
 export declare function parseLicenseFile(text: string): ParsedLicenseFile | null;
 
+export interface ActivationRequestFields {
+  appId: string;
+  hwid: string;
+  createdAt: string;
+  machineName?: string;
+  os?: string;
+  sdk?: string;
+  licenseKey?: string;
+}
+
+export interface CreateActivationRequestOptions {
+  /** Include hostname. Off by default — hostnames are often a person's name. */
+  includeMachineName?: boolean;
+  machineName?: string;
+  os?: string;
+  omitOs?: boolean;
+  sdk?: string;
+  omitSdk?: boolean;
+  licenseKey?: string;
+  /** Test override. Default is now (UTC, millisecond `Z`). */
+  createdAt?: string;
+}
+
+/** Armored `.authforge-request` text from explicit fields. */
+export declare function formatActivationRequest(fields: ActivationRequestFields): string;
+
 /**
  * Verify a `.authforge` file locally (no network). Check order:
  * bad_armor -> bad_signature -> unsupported_version -> malformed_payload ->
@@ -212,6 +238,13 @@ export declare class AuthForgeClient {
   getOfflineLicense(): OfflineLicenseSummary | null;
   /** HWID sent to AuthForge (or `hwidOverride`). Share it with the operator to get a bound file. */
   getHwid(): string;
+  /**
+   * Activation request (`.authforge-request`) for this machine. No network,
+   * no app secret. `machineName` is omitted unless `includeMachineName` is true.
+   */
+  createActivationRequest(options?: CreateActivationRequestOptions): string;
+  /** Write an activation request to `path`. */
+  writeActivationRequest(path: string, options?: CreateActivationRequestOptions): void;
   logout(): void;
   /** `true` for an online session (login) or an offline one (loginFromFile). */
   isAuthenticated(): boolean;
