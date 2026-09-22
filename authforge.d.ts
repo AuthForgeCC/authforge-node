@@ -38,6 +38,13 @@ export interface AuthForgeClientOptions {
   heartbeatMode?: string;
   heartbeatInterval?: number;
   apiBaseUrl?: string;
+  /**
+   * Called on `login_failed`, `heartbeat_failed`, `network_error` (login) and
+   * `offline_login_failed`. For `heartbeat_failed`, `error` is an
+   * `AuthForgeError`: transient failures keep checking in, fatal ones have
+   * already cleared the session. The callback may call `logout()`,
+   * `isAuthenticated()` or `login()`. Without a callback the process exits.
+   */
   onFailure?: ((reason: string, error: Error | null) => void) | null;
   requestTimeout?: number;
   /**
@@ -76,6 +83,51 @@ export type ValidateLicenseFailure = {
 };
 
 export type ValidateLicenseResult = ValidateLicenseSuccess | ValidateLicenseFailure;
+
+/**
+ * Failure passed to `onFailure`. For `heartbeat_failed` the error is always an
+ * `AuthForgeError`. `code` is the server's error code from the response body
+ * (any HTTP status, passed through even when this SDK version doesn't know
+ * it), or an SDK code such as `network_error`, `timeout`,
+ * `http_error_<status>` (non-JSON error body), `unexpected_response` (a failed
+ * check-in whose body is not `{"status":"failed","error":"<code>"}`) or
+ * `signature_mismatch`.
+ */
+export declare class AuthForgeError extends Error {
+  constructor(code: string, message?: string, options?: { cause?: unknown });
+  readonly name: "AuthForgeError";
+  readonly code: string;
+  /**
+   * `true` unless `code` is in `definitiveErrorCodes`: network failures,
+   * `rate_limited`, `system_error`, `no_credits`, `http_error_<status>`,
+   * `unexpected_response`, unknown codes, ... Transient check-in failures
+   * keep the session and keep checking in.
+   */
+  readonly transient: boolean;
+  /**
+   * `true` when `code` is in `definitiveErrorCodes` (`revoked`, `expired`,
+   * `hwid_mismatch`, `blocked`, `session_expired`, `malformed_request`,
+   * `app_disabled`, `invalid_app`, `signature_mismatch`). After a fatal
+   * `heartbeat_failed` the stored session has already been cleared.
+   */
+  readonly fatal: boolean;
+}
+
+/**
+ * Same classification as `AuthForgeError.transient`, for an error or a bare
+ * code: `true` unless the code is in `definitiveErrorCodes`. Anything that is
+ * neither a string nor an `AuthForgeError` returns `true`.
+ */
+export declare function isTransientError(errorOrCode: unknown): boolean;
+
+/**
+ * Named codes known to be transient, for reference. Classification does not
+ * depend on this list: every code outside `definitiveErrorCodes` is transient.
+ */
+export declare const transientErrorCodes: readonly string[];
+
+/** The only codes treated as a definitive verdict (fatal). */
+export declare const definitiveErrorCodes: readonly string[];
 
 export declare function verifyPayloadSignatureEd25519(
   payloadBase64: string,

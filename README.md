@@ -86,7 +86,7 @@ You can also copy `authforge.mjs` directly into your project if you prefer a sin
 | `heartbeatMode` | `string` | none | **Deprecated.** `"SERVER"` maps to `onlineHeartbeat: true`; `"LOCAL"` maps to the default. See [Migrating from heartbeatMode](#migrating-from-heartbeatmode). |
 | `heartbeatInterval` | `number` | `900` | Seconds between checks (online check-ins or local grace period re-verification; minimum `10`; default 15 min) |
 | `apiBaseUrl` | `string` | `https://auth.authforge.cc` | API endpoint |
-| `onFailure` | `function` | `null` | Callback `(reason: string, error: Error \| null)` on auth failure |
+| `onFailure` | `function` | `null` | Callback `(reason: string, error: Error \| null)` on auth failure; server and heartbeat errors are `AuthForgeError` with `code` / `transient` |
 | `requestTimeout` | `number` | `15` | HTTP request timeout in seconds |
 | `ttlSeconds` | `number \| null` | `null` (server default: 86400) | Requested grace period duration (session TTL) in seconds. Server clamps to `[3600, 604800]` (1h to 7d); preserved across online check-ins. |
 | `hwidOverride` | `string \| null` | `null` | Optional custom hardware/subject identifier. When set to a non-empty value, the SDK uses it instead of machine fingerprinting. |
@@ -123,7 +123,7 @@ const client = new AuthForgeClient({
 
 **Grace period (default)**: after one successful online activate/validate, the app keeps running on the Ed25519-signed session without contacting AuthForge. The SDK re-verifies the cached signature and checks the expiry timestamp locally at the configured interval; when the session TTL expires it triggers failure with `session_expired`. The grace period equals the session TTL (default 24h, server clamps 1h to 7d via `ttlSeconds`). It is session continuation, not persistent offline licensing: a mid-session revocation is not picked up until the next online validate or check-in.
 
-**Online check-ins (`onlineHeartbeat: true`)**: the SDK calls `/auth/heartbeat` every `heartbeatInterval` seconds with a fresh nonce, verifies signature + nonce, and triggers failure on invalid session state. Use this when you need fast revocation or concurrent-use detection.
+**Online check-ins (`onlineHeartbeat: true`)**: the SDK calls `/auth/heartbeat` every `heartbeatInterval` seconds with a fresh nonce, verifies signature + nonce, and triggers failure on invalid session state. Use this when you need fast revocation or concurrent-use detection. A definitive rejection (`revoked`, `hwid_mismatch`, `blocked`, ...) clears the stored session immediately; every other failure (network, `rate_limited`, `system_error`, `no_credits`, unknown codes, unexpected responses) is transient and keeps it until the session TTL runs out. See [Background check failures](#background-check-failures).
 
 ## Offline license files (`.authforge`)
 
@@ -216,21 +216,48 @@ If authentication fails (login rejected, check-in fails, grace period expired, s
 **`validateLicense()`** is different: it never starts background checks, does not mutate the client's stored session, and **never** invokes `onFailure` or exits the process. Inspect the returned `valid` / `code` fields instead.
 
 Recognized server errors (`knownServerErrors`):
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `system_error`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `demo_quota_exceeded`, `system_error`. Codes added to the server later are passed through unchanged.
 
 Request retries are automatic inside the internal HTTP layer:
 
-- `rate_limited`: retry after 2s, then 5s (max 3 attempts total)
+- `rate_limited` (or HTTP 429 with no error code): retry after 2s, then 5s (max 3 attempts total)
+- `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached` (also HTTP 429): never retried immediately; a background check tries again on the next interval
 - network failure: retry once after 2s
 - every retry regenerates a fresh nonce
 
+### Background check failures
+
+Background check failures reach `onFailure("heartbeat_failed", error)`, where `error` is an `AuthForgeError`:
+
+- `error.code`: the server's error code from the response body, whatever the HTTP status (`revoked`, `expired`, `hwid_mismatch`, `blocked`, `session_expired`, `rate_limited`, `no_credits`, `system_error`, `malformed_request`, ...; codes this SDK version doesn't know are passed through unchanged), or an SDK code: `network_error`, `timeout`, `http_error_<status>` (non-JSON error body), `unexpected_response`, `signature_mismatch`, `nonce_mismatch`. `error.message` is the code for server errors, `url_error: ...` for network failures.
+- `error.transient` / `error.fatal`: the classification. `isTransientError(errorOrCode)` is the same check as a function; `definitiveErrorCodes` is the allowlist and `transientErrorCodes` lists the named transient codes for reference.
+
+A failed check-in only counts as an AuthForge verdict when its body is `{"status": "failed", "error": "<code>"}`. Any other failure body (for example `{"error": "revoked"}` with no status, or `{"status": "failed"}` with no error, typically from a proxy or captive portal) is reported as `unexpected_response`, with the raw `status`/`error` in `error.message`.
+
+| Kind | Codes | What the SDK does |
+|---|---|---|
+| Definitive (`error.fatal`) | `revoked`, `expired`, `hwid_mismatch` (the HWID is no longer bound to the license, for example after an HWID reset), `blocked` (the HWID or IP is blacklisted, or not on the whitelist), `session_expired` (also raised locally when the grace period runs out), `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` | Clears the stored session (as `logout()` does) and stops background checks **before** calling `onFailure`, so the grace period cannot keep the app running on it. |
+| Transient (`error.transient`) | Everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, `unexpected_response`, every `http_error_<status>`, unparseable responses and any unrecognized code | Keeps the session and checks in again on the next `heartbeatInterval`. Once the signed session's TTL has passed, the next transient failure is reported as a definitive `session_expired` instead. |
+
+Transient failures only keep checking in if `onFailure` returns normally. Without a callback, any failure still calls `process.exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
+
+`onFailure` may safely call `logout()`, `isAuthenticated()` or `login()`: after a definitive failure `isAuthenticated()` is already `false`. A check-in that is still in flight when you call `logout()` or `login()` is discarded, so a late response never brings the old session back.
+
+To tolerate short outages but exit on a definitive answer:
+
 ```js
+import { AuthForgeClient, AuthForgeError } from "@authforgecc/sdk";
+
 const handleAuthFailure = (reason, error) => {
-  console.error(`Auth failed: ${reason}`);
-  if (error) {
-    console.error(`Details: ${error.message}`);
+  if (reason === "heartbeat_failed" && error instanceof AuthForgeError && error.transient) {
+    // No verdict on the license (outage, rate limit, credits, proxy): keep
+    // running. The SDK retries every heartbeatInterval and reports
+    // session_expired (fatal) once the ttlSeconds grace period is used up.
+    console.warn(`AuthForge check-in failed (${error.code}), retrying`);
+    return;
   }
-  // Clean up and exit gracefully
+  // Definitive: the session is already cleared (client.isAuthenticated() === false).
+  console.error(`License check failed: ${reason} (${error?.code ?? error?.message})`);
   process.exit(1);
 };
 
@@ -239,6 +266,7 @@ const client = new AuthForgeClient({
   appSecret: "YOUR_APP_SECRET",
   publicKey: "YOUR_PUBLIC_KEY",
   onlineHeartbeat: true,
+  ttlSeconds: 3600, // retry window for transient check-in failures
   onFailure: handleAuthFailure,
 });
 ```

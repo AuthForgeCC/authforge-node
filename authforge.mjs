@@ -1,5 +1,6 @@
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import https from "node:https";
 import os from "node:os";
 import { clearInterval as clearIntervalTimer, setInterval as setIntervalTimer } from "node:timers";
@@ -23,10 +24,88 @@ const KNOWN_SERVER_ERRORS = new Set([
   "revoke_requires_session",
   "bad_request",
   "malformed_request",
+  "demo_quota_exceeded",
   "system_error",
 ]);
 
+// The only codes that are a definitive verdict on the session or license.
+// Every other code, including ones this SDK version doesn't know, is transient.
+const DEFINITIVE_ERROR_CODES = new Set([
+  "revoked",
+  "expired",
+  "hwid_mismatch",
+  "blocked",
+  "session_expired",
+  "malformed_request",
+  "app_disabled",
+  "invalid_app",
+  "signature_mismatch",
+]);
+
+// Documentation only: named codes known to be transient. Classification is
+// "not in DEFINITIVE_ERROR_CODES", so http_error_<status> and unknown codes
+// are transient too.
+const TRANSIENT_ERROR_CODES = new Set([
+  "network_error",
+  "timeout",
+  "rate_limited",
+  "system_error",
+  "server_error",
+  "handler_error",
+  "invalid_json_response",
+  "response_not_json_object",
+  "unexpected_response",
+  "no_credits",
+  "demo_quota_exceeded",
+  "app_burn_cap_reached",
+  "bad_request",
+  "invalid_key",
+  "replay_detected",
+  "revoke_requires_session",
+  "missing_session_token",
+  "nonce_mismatch",
+  "unknown_error",
+]);
+const SERVER_ERROR_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
+
 const SUCCESS_STATUSES = new Set(["ok", "success", "valid", "true", "1"]);
+
+/**
+ * Classify a failure code (or an `AuthForgeError`). Only the definitive
+ * allowlist (`definitiveErrorCodes`) is fatal; every other code is transient,
+ * including `http_error_<status>`, `no_credits` and unknown codes. Values that
+ * are neither a string nor an `AuthForgeError` carry no verdict and count as
+ * transient.
+ */
+export function isTransientError(errorOrCode) {
+  const code = errorOrCode instanceof AuthForgeError ? errorOrCode.code : errorOrCode;
+  if (typeof code !== "string") return true;
+  return !DEFINITIVE_ERROR_CODES.has(code);
+}
+
+/**
+ * A failure with a machine-readable `code`: the server's error code
+ * (`revoked`, `hwid_mismatch`, ...) or an SDK code (`network_error`,
+ * `timeout`, `http_error_502`, `unexpected_response`, ...). `message` equals
+ * `code` for server errors.
+ */
+export class AuthForgeError extends Error {
+  constructor(code, message = code, options = undefined) {
+    super(message, options);
+    this.name = "AuthForgeError";
+    this.code = code;
+  }
+
+  /** True when retrying later can succeed. */
+  get transient() {
+    return isTransientError(this.code);
+  }
+
+  /** True when AuthForge definitively rejected the session or license. */
+  get fatal() {
+    return !this.transient;
+  }
+}
 
 function sleepSeconds(seconds) {
   return new Promise((resolve) => {
@@ -141,7 +220,7 @@ const ACTIVATION_REQUEST_VERSION = 1;
 const ACTIVATION_REQUEST_TYP = "authforge-activation-request";
 const BEGIN_ACTIVATION_REQUEST = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----";
 const END_ACTIVATION_REQUEST = "-----END AUTHFORGE ACTIVATION REQUEST-----";
-const SDK_TAG = "node/1.3.1";
+const SDK_TAG = "node/1.4.0";
 const MAX_REQUEST_HWID = 256;
 const MAX_REQUEST_MACHINE_NAME = 128;
 const MAX_REQUEST_OS = 64;
@@ -416,8 +495,9 @@ function postJson(urlText, body, timeoutSeconds) {
     timeout: timeoutSeconds * 1000,
   };
 
+  const transport = url.protocol === "http:" ? http : https;
   return new Promise((resolve, reject) => {
-    const request = https.request(options, (response) => {
+    const request = transport.request(options, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
       response.on("end", () => {
@@ -523,6 +603,10 @@ export class AuthForgeClient {
 
     this._heartbeatTimer = null;
     this._heartbeatStarted = false;
+    this._heartbeatInFlight = false;
+    // Bumped by login() and logout(). A heartbeat captures it when it starts
+    // and drops its result if it changed while the request was in flight.
+    this._sessionGeneration = 0;
 
     this._licenseKey = null;
     this._sessionToken = null;
@@ -718,6 +802,7 @@ export class AuthForgeClient {
       throw new Error("licenseKey must be a non-empty string");
     }
     this._requireAppSecret();
+    this._sessionGeneration += 1;
     try {
       await this._validateAndStore(licenseKey);
       this._startHeartbeatOnce();
@@ -798,6 +883,7 @@ export class AuthForgeClient {
     }
     this._heartbeatTimer = null;
     this._heartbeatStarted = false;
+    this._sessionGeneration += 1;
 
     this._licenseKey = null;
     this._sessionToken = null;
@@ -856,27 +942,67 @@ export class AuthForgeClient {
     }, this.heartbeatInterval * 1000);
   }
 
+  /**
+   * Run one background check. Transient failures are reported and the timer
+   * keeps checking in. Definitive failures drop the stored session first, so
+   * neither the grace period nor `isAuthenticated()` keeps the app running on
+   * it. `onFailure` may call `logout()`, `isAuthenticated()` or `login()`.
+   * A check that was in flight when `logout()`/`login()` ran is discarded.
+   */
   async _heartbeatTick() {
-    if (this._sessionKind === "offline") {
+    if (this._sessionKind === "offline" || this._heartbeatInFlight) {
       return;
     }
+    const generation = this._sessionGeneration;
+    this._heartbeatInFlight = true;
+    let failure = null;
     try {
       if (this.onlineHeartbeat) {
-        await this._serverHeartbeat();
+        await this._serverHeartbeat(generation);
       } else {
         this._gracePeriodCheck();
       }
     } catch (error) {
-      this._fail("heartbeat_failed", error);
-      if (this._heartbeatTimer !== null) {
-        clearIntervalTimer(this._heartbeatTimer);
-      }
-      this._heartbeatTimer = null;
-      this._heartbeatStarted = false;
+      failure = error;
+    } finally {
+      this._heartbeatInFlight = false;
     }
+    if (failure === null || generation !== this._sessionGeneration) {
+      return;
+    }
+    failure = this._heartbeatError(failure);
+    if (failure.fatal) {
+      this.logout();
+    }
+    this._fail("heartbeat_failed", failure);
   }
 
-  async _serverHeartbeat() {
+  _heartbeatError(error) {
+    let failure;
+    if (error instanceof AuthForgeError) {
+      failure = error;
+    } else {
+      const message = error instanceof Error ? error.message : String(error);
+      const code = message.split(":", 1)[0].trim().toLowerCase();
+      failure = new AuthForgeError(SERVER_ERROR_CODE_RE.test(code) ? code : "unknown_error", message, {
+        cause: error,
+      });
+    }
+    // A transient failure can't extend the session past its signed TTL.
+    if (failure.transient && this._localSessionExpired()) {
+      return new AuthForgeError("session_expired", "session_expired", { cause: failure });
+    }
+    return failure;
+  }
+
+  _localSessionExpired() {
+    if (this._sessionExpiresIn === null) {
+      return false;
+    }
+    return Math.floor(Date.now() / 1000) >= Number.parseInt(String(this._sessionExpiresIn), 10);
+  }
+
+  async _serverHeartbeat(generation = this._sessionGeneration) {
     const sessionToken = this._sessionToken;
     if (!sessionToken) {
       throw new Error("missing_session_token");
@@ -887,9 +1013,34 @@ export class AuthForgeClient {
       nonce: this._generateNonce(),
       hwid: this._hwid,
     };
-    const responseObject = await this._postJson("/auth/heartbeat", body);
+    // Network failures surface once, as heartbeat_failed / network_error.
+    const responseObject = await this._postJson("/auth/heartbeat", body, { skipFailureHook: true });
+    if (generation !== this._sessionGeneration) {
+      return;
+    }
+    if (!this._isSuccessStatus(responseObject?.status)) {
+      this._requireHeartbeatVerdict(responseObject);
+    }
     const expectedNonce = String(body.nonce ?? "").trim();
     this._applySignedResponse(responseObject, expectedNonce, null, "heartbeat");
+  }
+
+  /**
+   * A failed check-in is an AuthForge verdict only when the body is
+   * `{"status": "failed", "error": "<code>"}`. Anything else (a proxy, a
+   * captive portal, a half-written reply) is `unexpected_response`.
+   */
+  _requireHeartbeatVerdict(responseObject) {
+    const status = responseObject?.status;
+    const error = responseObject?.error;
+    const isFailed = typeof status === "string" && status.trim().toLowerCase() === "failed";
+    const hasCode = typeof error === "string" && error.trim() !== "";
+    if (!isFailed || !hasCode) {
+      throw new AuthForgeError(
+        "unexpected_response",
+        `unexpected_response: status=${JSON.stringify(status ?? null)} error=${JSON.stringify(error ?? null)}`,
+      );
+    }
   }
 
   /**
@@ -978,7 +1129,7 @@ export class AuthForgeClient {
 
   _parseValidateSuccess(responseObject, expectedNonce) {
     if (!this._isSuccessStatus(responseObject?.status)) {
-      throw new Error(this._extractServerError(responseObject));
+      throw new AuthForgeError(this._extractServerError(responseObject));
     }
 
     const rawPayloadB64 = this._requireStr(responseObject, "payload");
@@ -1089,21 +1240,22 @@ export class AuthForgeClient {
         } catch (error) {
           if (networkAttempt === 0) {
             networkAttempt += 1;
-            await sleepSeconds(NETWORK_RETRY_DELAY);
+            await this._sleep(NETWORK_RETRY_DELAY);
             continue;
           }
           if (!skipFailureHook) {
             this._fail("network_error", error);
           }
-          throw new Error(`url_error: ${error}`);
+          const code = error instanceof Error && error.message === "timeout" ? "timeout" : "network_error";
+          throw new AuthForgeError(code, `url_error: ${error}`, { cause: error });
         }
 
         lastStatusCode = statusCode;
         if (statusCode >= 400) {
           try {
             parsedResponse = this._parseResponseObject(raw);
-          } catch {
-            throw new Error(`http_error_${statusCode}`);
+          } catch (error) {
+            throw new AuthForgeError(`http_error_${statusCode}`, `http_error_${statusCode}`, { cause: error });
           }
         } else {
           parsedResponse = this._parseResponseObject(raw);
@@ -1116,16 +1268,22 @@ export class AuthForgeClient {
         break;
       }
 
+      // no_credits / demo_quota_exceeded / app_burn_cap_reached also use
+      // HTTP 429 but are not worth retrying; only retry a genuine rate limit.
+      const serverError = this._extractServerError(parsedResponse);
       const isRateLimited =
-        lastStatusCode === 429 ||
-        this._extractServerError(parsedResponse) === "rate_limited";
+        serverError === "rate_limited" || (lastStatusCode === 429 && serverError === "unknown_error");
       if (isRateLimited && rateAttempt < RATE_LIMIT_RETRY_DELAYS.length) {
-        await sleepSeconds(RATE_LIMIT_RETRY_DELAYS[rateAttempt]);
+        await this._sleep(RATE_LIMIT_RETRY_DELAYS[rateAttempt]);
         rateAttempt += 1;
         continue;
       }
       return parsedResponse;
     }
+  }
+
+  _sleep(seconds) {
+    return sleepSeconds(seconds);
   }
 
   _parseResponseObject(rawResponse) {
@@ -1300,8 +1458,10 @@ export class AuthForgeClient {
   }
 
   _extractServerError(obj) {
-    const rawError = String(obj?.error ?? "").trim().toLowerCase();
-    if (KNOWN_SERVER_ERRORS.has(rawError)) {
+    // Pass through codes this SDK version doesn't know yet instead of
+    // collapsing them into unknown_error.
+    const rawError = typeof obj?.error === "string" ? obj.error.trim().toLowerCase() : "";
+    if (KNOWN_SERVER_ERRORS.has(rawError) || SERVER_ERROR_CODE_RE.test(rawError)) {
       return rawError;
     }
     const status = String(obj?.status ?? "").trim().toLowerCase();
@@ -1329,3 +1489,5 @@ export class AuthForgeClient {
 }
 
 export const knownServerErrors = [...KNOWN_SERVER_ERRORS];
+export const transientErrorCodes = [...TRANSIENT_ERROR_CODES];
+export const definitiveErrorCodes = [...DEFINITIVE_ERROR_CODES];
