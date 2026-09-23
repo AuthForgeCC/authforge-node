@@ -37,14 +37,20 @@ Or copy `authforge.mjs` into your project (single file, Node.js built-ins only).
 
 ```js
 import process from "node:process";
-import { AuthForgeClient } from "@authforgecc/sdk";
+import { AuthForgeClient, AuthForgeError } from "@authforgecc/sdk";
+
+// Aborted when the license is lost; the app listens and shuts down cleanly.
+const licenseLost = new AbortController();
 
 const onFailure = (reason, error) => {
+  if (reason === "heartbeat_failed" && error instanceof AuthForgeError && error.transient) {
+    return; // network blip / rate_limited: the SDK checks in again next interval
+  }
   console.error(`AuthForge: ${reason}`);
   if (error) {
     console.error(error);
   }
-  process.exit(1);
+  licenseLost.abort(error); // do not process.exit() here: let the app save first
 };
 
 const client = new AuthForgeClient({
@@ -66,8 +72,20 @@ if (!ok) {
   process.exit(1);
 }
 
+licenseLost.signal.addEventListener(
+  "abort",
+  () => {
+    // Save the user's work and close servers/timers here; Node then exits on its own.
+    client.logout();
+    process.exitCode = 1;
+  },
+  { once: true },
+);
+
 // --- Your application code starts here ---
 console.log("Running with a valid license.");
+// Long-running work should watch licenseLost.signal (pass it to fetch(), or check
+// licenseLost.signal.aborted between steps) and stop cleanly when it fires.
 // --- Your application code ends here ---
 
 client.logout();
@@ -86,7 +104,7 @@ This default configuration activates online once and then runs through the grace
 | `heartbeatMode` | `string` | no | - | **Deprecated.** `"SERVER"` or `"LOCAL"` (case-insensitive); still the 4th positional arg for compatibility. See [Migrating from heartbeatMode](#migrating-from-heartbeatmode) |
 | `heartbeatInterval` | `number` | no | `900` | Seconds between background checks (minimum `10`) |
 | `apiBaseUrl` | `string` | no | `https://auth.authforge.cc` | API base URL |
-| `onFailure` | `(reason: string, error: Error \| null) => void \| null` | no | `null` | Called on login/check-in/network failure; if omitted, process exits via `process.exit(1)` |
+| `onFailure` | `(reason: string, error: Error \| null) => void \| null` | no | `null` | Called on login/check-in/network failure. If omitted, a transient background check failure prints a one-line warning to stderr and check-ins continue; any other failure exits via `process.exit(1)` |
 | `requestTimeout` | `number` | no | `15` | HTTP timeout (seconds) |
 | `ttlSeconds` | `number \| null` | no | `null` (server default: 86400) | Requested grace period duration (session TTL) in seconds. Server clamps to `[3600, 604800]` (1h to 7d) and preserves the lifetime across check-in refreshes. |
 | `hwidOverride` | `string \| null` | no | `null` | Optional custom HWID/subject string. When set to a non-empty value (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
@@ -187,6 +205,8 @@ Server error codes appear as `AuthForgeError` in the `error` passed to `onFailur
 ```js
 import { AuthForgeError } from "@authforgecc/sdk";
 
+const licenseLost = new AbortController(); // the app listens for "abort", saves work, then exits
+
 const onFailure = (reason, error) => {
   if (reason === "heartbeat_failed" && error instanceof AuthForgeError && error.transient) {
     return; // no verdict (network, rate_limited, no_credits, ...): SDK retries next interval
@@ -196,15 +216,18 @@ const onFailure = (reason, error) => {
   if (new Set(["invalid_key", "expired", "revoked", "hwid_mismatch", "blocked"]).has(code)) {
     console.error(`License issue: ${code}`);
   }
-  process.exit(1);
+  licenseLost.abort(error);
 };
 ```
+
+`process.exit(1)` inside `onFailure` is a last resort: it does not wait for pending writes, so save the user's work first.
 
 ## Do NOT
 
 - Do not hardcode the app secret as a plain string literal in source - use environment variables or encrypted config
 - Do not embed the App Secret in air-gapped / `loginFromFile` builds - omit it or pass `""`; verification only needs app id + public key
-- Do not skip the `onFailure` callback - without it, background check failures terminate the process via `process.exit(1)` without your cleanup
+- Do not skip the `onFailure` callback - without it, transient check-in failures only print a stderr warning, but definitive ones (and a failed `login()`) terminate the process via `process.exit(1)` without your cleanup
+- Do not call `process.exit()` from `onFailure` as the normal shutdown path - signal the app (for example an `AbortController`) so it can save work and exit cleanly
 - Do not treat every `heartbeat_failed` as a network blip or every one as fatal - check `error.transient` (only the `definitiveErrorCodes` allowlist is fatal). Fatal failures have already cleared the session, so do not keep the app running on it
 - Do not call `login()` on every app action - call it once at startup; the background checks handle the rest
 - Do not use `heartbeatMode` in new code - it is deprecated; use `onlineHeartbeat: true` when you need online check-ins, or nothing at all for the default grace period

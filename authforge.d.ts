@@ -43,7 +43,9 @@ export interface AuthForgeClientOptions {
    * `offline_login_failed`. For `heartbeat_failed`, `error` is an
    * `AuthForgeError`: transient failures keep checking in, fatal ones have
    * already cleared the session. The callback may call `logout()`,
-   * `isAuthenticated()` or `login()`. Without a callback the process exits.
+   * `isAuthenticated()` or `login()`. Without a callback, a transient
+   * background check failure logs a one-line warning to stderr and check-ins
+   * continue; any other failure exits the process.
    */
   onFailure?: ((reason: string, error: Error | null) => void) | null;
   requestTimeout?: number;

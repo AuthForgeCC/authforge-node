@@ -211,7 +211,7 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 
 ## Failure Handling
 
-If authentication fails (login rejected, check-in fails, grace period expired, signature mismatch, etc.), the SDK calls your `onFailure` callback if one is provided. If no callback is set, **the SDK calls `process.exit(1)` to terminate the process.** This prevents your app from running without a valid license.
+If authentication fails (login rejected, check-in fails, grace period expired, signature mismatch, etc.), the SDK calls your `onFailure` callback if one is provided. Without a callback, a transient background check failure (network outage, `rate_limited`, `system_error`, ...) writes a one-line warning to stderr and check-ins continue; every other failure (a rejected `login()`, a definitive check-in answer, the grace period running out) **calls `process.exit(1)` to terminate the process**, so your app cannot keep running without a valid license. `process.exit` does not wait for pending writes, so set `onFailure` if your app has anything to save.
 
 **`validateLicense()`** is different: it never starts background checks, does not mutate the client's stored session, and **never** invokes `onFailure` or exits the process. Inspect the returned `valid` / `code` fields instead.
 
@@ -239,14 +239,17 @@ A failed check-in only counts as an AuthForge verdict when its body is `{"status
 | Definitive (`error.fatal`) | `revoked`, `expired`, `hwid_mismatch` (the HWID is no longer bound to the license, for example after an HWID reset), `blocked` (the HWID or IP is blacklisted, or not on the whitelist), `session_expired` (also raised locally when the grace period runs out), `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` | Clears the stored session (as `logout()` does) and stops background checks **before** calling `onFailure`, so the grace period cannot keep the app running on it. |
 | Transient (`error.transient`) | Everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, `unexpected_response`, every `http_error_<status>`, unparseable responses and any unrecognized code | Keeps the session and checks in again on the next `heartbeatInterval`. Once the signed session's TTL has passed, the next transient failure is reported as a definitive `session_expired` instead. |
 
-Transient failures only keep checking in if `onFailure` returns normally. Without a callback, any failure still calls `process.exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
+Transient failures only keep checking in if `onFailure` returns normally. Without a callback, a transient failure prints `AuthForge: background check failed (<code>); retrying next interval` to stderr and check-ins continue; a fatal one, including the `session_expired` a transient failure becomes once the session TTL has passed, still calls `process.exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
 
 `onFailure` may safely call `logout()`, `isAuthenticated()` or `login()`: after a definitive failure `isAuthenticated()` is already `false`. A check-in that is still in flight when you call `logout()` or `login()` is discarded, so a late response never brings the old session back.
 
-To tolerate short outages but exit on a definitive answer:
+To tolerate short outages but shut down on a definitive answer, have the callback signal the rest of your app and let it save and exit:
 
 ```js
+import process from "node:process";
 import { AuthForgeClient, AuthForgeError } from "@authforgecc/sdk";
+
+const licenseLost = new AbortController();
 
 const handleAuthFailure = (reason, error) => {
   if (reason === "heartbeat_failed" && error instanceof AuthForgeError && error.transient) {
@@ -258,7 +261,7 @@ const handleAuthFailure = (reason, error) => {
   }
   // Definitive: the session is already cleared (client.isAuthenticated() === false).
   console.error(`License check failed: ${reason} (${error?.code ?? error?.message})`);
-  process.exit(1);
+  licenseLost.abort(error); // signal the app instead of exiting here
 };
 
 const client = new AuthForgeClient({
@@ -269,7 +272,20 @@ const client = new AuthForgeClient({
   ttlSeconds: 3600, // retry window for transient check-in failures
   onFailure: handleAuthFailure,
 });
+
+licenseLost.signal.addEventListener(
+  "abort",
+  async () => {
+    await saveUserWork();
+    server.close(); // close whatever keeps the event loop alive (servers, intervals, sockets)
+    client.logout();
+    process.exitCode = 1; // Node exits once nothing is left running
+  },
+  { once: true },
+);
 ```
+
+You can also pass `licenseLost.signal` to APIs that accept an `AbortSignal` (`fetch`, `setTimeout` from `node:timers/promises`, `events.once`, ...) so in-flight work stops with it. Calling `process.exit(1)` inside `onFailure` is a last resort: it ends the process without waiting for pending writes or `finally` blocks, so save the user's work first.
 
 ## Self-ban (tamper response)
 

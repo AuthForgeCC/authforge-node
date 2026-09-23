@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.1
+
+### Fixes
+
+- **No more exit on transient failures without a callback.** Without `onFailure`, a transient background check failure (network outage, timeout, `rate_limited`, `system_error`, `no_credits`, ...) no longer calls `process.exit(1)`. The SDK writes one line to stderr, `AuthForge: background check failed (<code>); retrying next interval`, keeps the session and checks in again on the next interval. Previously a brief outage killed any app that enabled online check-ins without setting a callback.
+- Unchanged: without a callback, definitive failures (including the `session_expired` a transient failure becomes once the session TTL has passed) and failed `login()` calls still call `process.exit(1)`.
+
+### Docs
+
+- The README and `AGENTS.md` examples no longer call `process.exit(1)` from `onFailure`. They abort an `AbortController` that the app listens to, so it can save work, close what it opened and exit; `process.exit` is kept as a last resort after saving.
+
 ## 1.4.0
 
 ### Behavior changes for callers

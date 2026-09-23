@@ -220,7 +220,7 @@ const ACTIVATION_REQUEST_VERSION = 1;
 const ACTIVATION_REQUEST_TYP = "authforge-activation-request";
 const BEGIN_ACTIVATION_REQUEST = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----";
 const END_ACTIVATION_REQUEST = "-----END AUTHFORGE ACTIVATION REQUEST-----";
-const SDK_TAG = "node/1.4.0";
+const SDK_TAG = "node/1.4.1";
 const MAX_REQUEST_HWID = 256;
 const MAX_REQUEST_MACHINE_NAME = 128;
 const MAX_REQUEST_OS = 64;
@@ -943,8 +943,9 @@ export class AuthForgeClient {
   }
 
   /**
-   * Run one background check. Transient failures are reported and the timer
-   * keeps checking in. Definitive failures drop the stored session first, so
+   * Run one background check. Transient failures are reported (a stderr
+   * warning when there is no `onFailure`) and the timer keeps checking in.
+   * Definitive failures drop the stored session first, so
    * neither the grace period nor `isAuthenticated()` keeps the app running on
    * it. `onFailure` may call `logout()`, `isAuthenticated()` or `login()`.
    * A check that was in flight when `logout()`/`login()` ran is discarded.
@@ -973,6 +974,10 @@ export class AuthForgeClient {
     failure = this._heartbeatError(failure);
     if (failure.fatal) {
       this.logout();
+    }
+    if (failure.transient && !this.onFailure) {
+      console.warn(`AuthForge: background check failed (${failure.code}); retrying next interval`);
+      return;
     }
     this._fail("heartbeat_failed", failure);
   }

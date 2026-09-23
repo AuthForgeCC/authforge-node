@@ -610,6 +610,66 @@ test("grace period expiry is definitive session_expired and drops the session", 
   });
 });
 
+test("without onFailure, a transient heartbeat failure warns on stderr and keeps checking in", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const exit = t.mock.method(process, "exit", () => {});
+  await withServer(
+    () => [503, { status: "failed", error: "system_error" }],
+    async (apiBaseUrl) => {
+      const { client } = await onlineClient(apiBaseUrl, { onFailure: null });
+      await tickWithTimer(client, () => {
+        assert.equal(exit.mock.callCount(), 0);
+        assert.deepEqual(
+          warn.mock.calls.map((call) => call.arguments),
+          [["AuthForge: background check failed (system_error); retrying next interval"]],
+        );
+        assertKept(client);
+      });
+    },
+  );
+});
+
+for (const [label, reply, expiresOffset] of [
+  ["revoked", [410, { status: "failed", error: "revoked" }], 3600],
+  ["TTL-promoted session_expired", [503, { status: "failed", error: "system_error" }], -1],
+]) {
+  test(`without onFailure, a definitive heartbeat failure (${label}) still exits`, async (t) => {
+    const warn = t.mock.method(console, "warn", () => {});
+    const exit = t.mock.method(process, "exit", () => {});
+    await withServer(
+      () => reply,
+      async (apiBaseUrl) => {
+        const { client } = await onlineClient(apiBaseUrl, { onFailure: null });
+        client._sessionExpiresIn = Math.floor(Date.now() / 1000) + expiresOffset;
+        await tickWithTimer(client, () => {
+          assert.deepEqual(
+            exit.mock.calls.map((call) => call.arguments),
+            [[1]],
+          );
+          assert.equal(warn.mock.callCount(), 0);
+          assertInvalidated(client);
+        });
+      },
+    );
+  });
+}
+
+test("without onFailure, a login failure still exits", async (t) => {
+  const exit = t.mock.method(process, "exit", () => {});
+  await withServer(
+    () => [401, { status: "failed", error: "invalid_key" }],
+    async (apiBaseUrl) => {
+      const { client } = await onlineClient(apiBaseUrl, { onFailure: null });
+      client.logout();
+      assert.equal(await client.login("license-key"), false);
+      assert.deepEqual(
+        exit.mock.calls.map((call) => call.arguments),
+        [[1]],
+      );
+    },
+  );
+});
+
 for (const [label, code, status] of [
   ["transient", "system_error", 500],
   ["definitive", "revoked", 410],
