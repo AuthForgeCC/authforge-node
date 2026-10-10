@@ -11,7 +11,8 @@ export interface VariableMap {
 export interface AuthForgeClientOptions {
   appId: string;
   /**
-   * Required for online APIs (`login`, `validateLicense`, `selfBan`).
+   * Required for online APIs (`login`, `validateLicense`, `selfBan`,
+   * `activateOffline`).
    * Omit, or pass `""` / `null`, for offline-only clients (`loginFromFile`).
    * Air-gapped builds should not ship the App Secret.
    */
@@ -109,8 +110,9 @@ export declare class AuthForgeError extends Error {
   /**
    * `true` when `code` is in `definitiveErrorCodes` (`revoked`, `expired`,
    * `hwid_mismatch`, `blocked`, `session_expired`, `malformed_request`,
-   * `app_disabled`, `invalid_app`, `signature_mismatch`). After a fatal
-   * `heartbeat_failed` the stored session has already been cleared.
+   * `app_disabled`, `invalid_app`, `signature_mismatch`, and the
+   * `OfflineActivationErrorCode`s). After a fatal `heartbeat_failed` the
+   * stored session has already been cleared.
    */
   readonly fatal: boolean;
 }
@@ -225,7 +227,29 @@ export declare function verifyLicenseFile(params: {
 
 export declare const offlineLicenseErrors: readonly OfflineLicenseError[];
 
-/** How the client authenticated: server session (`login`) or local file (`loginFromFile`). */
+/**
+ * Codes added for self-serve offline activation (`activateOffline`). All are
+ * fatal. The first four come from the server; `offline_file_rejected` is the
+ * SDK's code for a returned file that fails local verification (the
+ * verifier's reason, e.g. `bad_signature`, is in the error message).
+ */
+export type OfflineActivationErrorCode =
+  | "offline_activation_disabled"
+  | "offline_activation_requires_perpetual"
+  | "offline_activation_requires_seats"
+  | "offline_activation_limit_reached"
+  | "offline_file_rejected";
+
+export interface ActivateOfflineOptions {
+  /**
+   * Where to save the `.authforge` file. Written atomically (temp file +
+   * rename) after it verifies; parent directories are created. Omit to only
+   * start the offline session.
+   */
+  path?: string | null;
+}
+
+/** How the client authenticated: server session (`login`) or local file (`loginFromFile`/`activateOffline`). */
 export type SessionKind = "online" | "offline";
 
 export interface OfflineLicenseSummary {
@@ -286,6 +310,22 @@ export declare class AuthForgeClient {
    * return `false` (never `process.exit`).
    */
   loginFromFile(pathOrText: string): boolean;
+  /**
+   * Self-serve offline activation: one `POST /auth/offline/activate` call
+   * turns the key into a lifetime file bound to this HWID. Needs the app
+   * secret. 2 credits per new machine (charged to the app owner); the same
+   * machine activating again is free and gets the identical file. The file is
+   * verified locally before it is written to `options.path`; on success the
+   * client holds an offline session exactly as after `loginFromFile()`.
+   *
+   * Resolves `true`. Rejects with an `AuthForgeError` on refusal or failure
+   * (`offline_activation_limit_reached`, `hwid_mismatch` (no free seat),
+   * `invalid_key`, `offline_file_rejected`, `file_write_failed`,
+   * `rate_limited`, `network_error`, ...). Never calls `onFailure` or
+   * `process.exit`, and never writes `path` on failure. A missing app secret
+   * rejects with a plain `Error` before any request.
+   */
+  activateOffline(licenseKey: string, options?: ActivateOfflineOptions): Promise<boolean>;
   /** Verify a `.authforge` file with this client's app id / keys / HWID; no state change. */
   verifyLicenseFile(pathOrText: string, options?: { now?: Date | number }): VerifyLicenseFileResult;
   /** Offline file the client authenticated with, or `null`. */
@@ -300,11 +340,12 @@ export declare class AuthForgeClient {
   /** Write an activation request to `path`. */
   writeActivationRequest(path: string, options?: CreateActivationRequestOptions): void;
   logout(): void;
-  /** `true` for an online session (login) or an offline one (loginFromFile). */
+  /** `true` for an online session (login) or an offline one (loginFromFile / activateOffline). */
   isAuthenticated(): boolean;
   /**
    * Which kind of session the client holds: `"online"` after `login()`,
-   * `"offline"` after `loginFromFile()`, `null` when logged out. `selfBan()`
+   * `"offline"` after `loginFromFile()` or `activateOffline()`, `null` when
+   * logged out. `selfBan()`
    * without an explicit `licenseKey`/`sessionToken` throws `offline_session`
    * on an offline session and never contacts the server.
    */

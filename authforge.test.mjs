@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +12,7 @@ import {
   definitiveErrorCodes,
   formatActivationRequest,
   isTransientError,
+  knownServerErrors,
   parseLicenseFile,
   transientErrorCodes,
   verifyLicenseFile,
@@ -802,6 +803,11 @@ test("isTransientError: only the definitive allowlist is fatal", () => {
     "hwid_mismatch",
     "invalid_app",
     "malformed_request",
+    "offline_activation_disabled",
+    "offline_activation_limit_reached",
+    "offline_activation_requires_perpetual",
+    "offline_activation_requires_seats",
+    "offline_file_rejected",
     "revoked",
     "session_expired",
     "signature_mismatch",
@@ -1178,5 +1184,416 @@ test("writeActivationRequest writes UTF-8 next to the app", async () => {
     }));
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Self-serve offline activation (`POST /auth/offline/activate`)
+// ---------------------------------------------------------------------------
+
+async function readSelfServeVectors() {
+  const raw = await readFile(path.join(here, "self_serve_activation_vectors.json"), "utf8");
+  return JSON.parse(raw);
+}
+
+/**
+ * Local HTTP server that records every request (method, path, parsed JSON
+ * body) and answers each one with `respond(request)` -> [status, body].
+ */
+async function withRecordingServer(respond, fn) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      const request = { method: req.method, path: req.url, body: JSON.parse(raw) };
+      requests.push(request);
+      const [status, body] = respond(request);
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(typeof body === "string" ? body : JSON.stringify(body));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    return await fn(`http://127.0.0.1:${server.address().port}`, requests);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+function selfServeClient(vectors, apiBaseUrl, overrides = {}) {
+  const { config } = vectors;
+  const failures = [];
+  const sleeps = [];
+  const client = new AuthForgeClient({
+    appId: config.appId,
+    appSecret: config.appSecret,
+    publicKey: config.publicKey,
+    hwidOverride: config.hwid,
+    apiBaseUrl,
+    onFailure: (reason, error) => failures.push([reason, error?.code ?? error?.message]),
+    ...overrides,
+  });
+  // Rate-limit and network retries without the real 2s/5s waits.
+  client._sleep = async (seconds) => {
+    sleeps.push(seconds);
+  };
+  return { client, failures, sleeps };
+}
+
+function assertActivationRequests(vectors, client, requests) {
+  const { config, request: spec } = vectors;
+  assert.ok(requests.length >= 1);
+  for (const req of requests) {
+    assert.equal(req.method, spec.method);
+    assert.equal(req.path, spec.path);
+    assert.deepEqual(Object.keys(req.body).sort(), [...spec.bodyFields].sort());
+    assert.equal(req.body.appId, config.appId);
+    assert.equal(req.body.appSecret, config.appSecret);
+    assert.equal(req.body.licenseKey, config.licenseKey);
+    assert.equal(req.body.hwid, config.hwid);
+    assert.equal(req.body.hwid, client.getHwid());
+    assert.match(req.body.nonce, /^[0-9a-f]{32}$/);
+  }
+  // Every attempt (rate-limit retries included) carries a fresh nonce.
+  assert.equal(new Set(requests.map((r) => r.body.nonce)).size, requests.length);
+}
+
+/** Sorted directory entries, or `null` when the directory does not exist. */
+async function listDir(dir) {
+  try {
+    return (await readdir(dir)).sort();
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+for (const vectorCase of (await readSelfServeVectors()).cases) {
+  const { expect } = vectorCase;
+  // Error cases run twice: with no file at `path` (must not be created) and
+  // with a pre-existing file (must be left byte-for-byte untouched).
+  const variants = expect.outcome === "activated" ? ["absent"] : ["absent", "existing"];
+  for (const variant of variants) {
+    test(`self-serve activation vector ${vectorCase.name} (${variant} file)`, async () => {
+      const vectors = await readSelfServeVectors();
+      const dir = await mkdtemp(path.join(os.tmpdir(), "authforge-activate-"));
+      const targetDir = path.join(dir, "nested", "licenses");
+      const target = path.join(targetDir, "license.authforge");
+      const preexisting = "PRE-EXISTING FILE: must not change\n";
+      if (variant === "existing") {
+        await mkdir(targetDir, { recursive: true });
+        await writeFile(target, preexisting, "utf8");
+      }
+      try {
+        await withRecordingServer(
+          () => [vectorCase.response.status, vectorCase.response.body],
+          async (apiBaseUrl, requests) => {
+            const { client, failures, sleeps } = selfServeClient(vectors, apiBaseUrl);
+
+            if (expect.outcome === "activated") {
+              assert.equal(await client.activateOffline(vectors.config.licenseKey, { path: target }), true);
+              assert.equal(expect.writesFile, true);
+              const written = await readFile(target);
+              assert.ok(written.equals(Buffer.from(expect.fileWritten, "utf8")), "file bytes match fileWritten");
+              assert.deepEqual(await listDir(targetDir), ["license.authforge"], "no temp files left behind");
+              assert.equal(client.isAuthenticated(), true);
+              assert.equal(client.getSessionKind(), expect.sessionKind);
+              assert.deepEqual(client.getLicenseVariables(), expect.licenseVariables);
+              assert.deepEqual(client.getAppVariables(), expect.appVariables);
+              assert.equal(client._sessionToken, null);
+              assert.equal(client._heartbeatStarted, false);
+              assert.equal(client._heartbeatTimer, null);
+              const offline = client.getOfflineLicense();
+              assert.equal(offline.licenseKey, vectors.config.licenseKey);
+              assert.equal(offline.jti, vectorCase.response.body.jti);
+              assert.equal(offline.expiresAt, null);
+              assert.deepEqual(offline.hwidPolicy, { mode: "bound", hwids: [vectors.config.hwid] });
+              // replay true/false (200/201) is handled identically: same bytes, same session.
+              assert.equal(vectorCase.response.body.replay, expect.replay);
+              assert.equal(requests.length, 1);
+              assert.deepEqual(sleeps, []);
+              // The written file is exactly what loginFromFile() accepts on the next launch.
+              const { client: nextLaunch } = selfServeClient(vectors, "http://127.0.0.1:9");
+              assert.equal(nextLaunch.loginFromFile(target), true);
+              assert.deepEqual(nextLaunch.getLicenseVariables(), expect.licenseVariables);
+            } else {
+              const error = await client.activateOffline(vectors.config.licenseKey, { path: target }).then(
+                () => assert.fail("expected activateOffline to reject"),
+                (err) => err,
+              );
+              assert.ok(error instanceof AuthForgeError, String(error));
+              assert.equal(error.code, expect.errorCode);
+              assert.equal(error.fatal, expect.fatal);
+              assert.equal(error.transient, !expect.fatal);
+              assert.equal(isTransientError(error), !expect.fatal);
+              if (expect.detail !== undefined) {
+                assert.ok(error.message.includes(expect.detail), `${error.message} includes ${expect.detail}`);
+              }
+              assert.equal(expect.writesFile, false);
+              if (variant === "existing") {
+                assert.equal(await readFile(target, "utf8"), preexisting);
+                assert.deepEqual(await listDir(targetDir), ["license.authforge"], "no temp files left behind");
+              } else {
+                const entries = await listDir(targetDir);
+                assert.ok(entries === null || entries.length === 0, `nothing written: ${entries}`);
+              }
+              assert.equal(client.isAuthenticated(), false);
+              assert.equal(client.getSessionKind(), null);
+              assert.equal(client.getOfflineLicense(), null);
+              assert.equal(client._heartbeatStarted, false);
+              if (expect.errorCode === "rate_limited") {
+                assert.equal(requests.length, 3);
+                assert.deepEqual(sleeps, [2, 5]);
+              } else {
+                assert.equal(requests.length, 1);
+                assert.deepEqual(sleeps, []);
+              }
+            }
+            assertActivationRequests(vectors, client, requests);
+            assert.deepEqual(failures, [], "activateOffline never calls onFailure");
+          },
+        );
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+test("self-serve activation: the server's hwid_mismatch and a rejected file stay distinguishable", async () => {
+  const vectors = await readSelfServeVectors();
+  const byName = Object.fromEntries(vectors.cases.map((c) => [c.name, c]));
+  const codes = [];
+  for (const name of ["error_hwid_mismatch", "reject_other_hwid"]) {
+    await withRecordingServer(
+      () => [byName[name].response.status, byName[name].response.body],
+      async (apiBaseUrl) => {
+        const { client } = selfServeClient(vectors, apiBaseUrl);
+        await client.activateOffline(vectors.config.licenseKey).catch((error) => codes.push(error.code));
+      },
+    );
+  }
+  assert.deepEqual(codes, ["hwid_mismatch", "offline_file_rejected"]);
+});
+
+test("self-serve activation replaces a stale file at path (the re-activation pattern)", async () => {
+  const vectors = await readSelfServeVectors();
+  const good = vectors.cases.find((c) => c.name === "activated_replay");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "authforge-activate-"));
+  const target = path.join(dir, "license.authforge");
+  // e.g. a file bound to this machine's old hardware: loginFromFile fails, so the app re-activates.
+  await writeFile(target, "stale file from old hardware\n", "utf8");
+  try {
+    await withRecordingServer(
+      () => [good.response.status, good.response.body],
+      async (apiBaseUrl) => {
+        const { client } = selfServeClient(vectors, apiBaseUrl);
+        assert.equal(client.loginFromFile(target), false);
+        assert.equal(await client.activateOffline(vectors.config.licenseKey, { path: target }), true);
+        assert.equal(await readFile(target, "utf8"), good.expect.fileWritten);
+        assert.deepEqual(await listDir(dir), ["license.authforge"]);
+        assert.equal(client.getSessionKind(), "offline");
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("self-serve activation without path starts the offline session and writes nothing", async () => {
+  const vectors = await readSelfServeVectors();
+  const good = vectors.cases.find((c) => c.name === "activated_new_machine");
+  await withRecordingServer(
+    () => [good.response.status, good.response.body],
+    async (apiBaseUrl, requests) => {
+      const { client } = selfServeClient(vectors, apiBaseUrl);
+      assert.equal(await client.activateOffline(vectors.config.licenseKey), true);
+      assert.equal(client.getSessionKind(), "offline");
+      assert.deepEqual(client.getLicenseVariables(), good.expect.licenseVariables);
+      assert.equal(requests.length, 1);
+    },
+  );
+});
+
+test("self-serve activation replaces an online session (no heartbeat left running)", async () => {
+  const vectors = await readSelfServeVectors();
+  const good = vectors.cases.find((c) => c.name === "activated_replay");
+  await withRecordingServer(
+    () => [good.response.status, good.response.body],
+    async (apiBaseUrl) => {
+      const { client } = selfServeClient(vectors, apiBaseUrl, { onlineHeartbeat: true });
+      client._sessionToken = "session.validate.token";
+      client._sessionKind = "online";
+      client._authenticated = true;
+      client._startHeartbeatOnce();
+      assert.notEqual(client._heartbeatTimer, null);
+      assert.equal(await client.activateOffline(vectors.config.licenseKey), true);
+      assert.equal(client.getSessionKind(), "offline");
+      assert.equal(client._sessionToken, null);
+      assert.equal(client._heartbeatStarted, false);
+      assert.equal(client._heartbeatTimer, null);
+      client.logout();
+    },
+  );
+});
+
+test("self-serve activation requires the app secret and fails before any request", async () => {
+  const vectors = await readSelfServeVectors();
+  const good = vectors.cases.find((c) => c.name === "activated_new_machine");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "authforge-activate-"));
+  const target = path.join(dir, "license.authforge");
+  try {
+    await withRecordingServer(
+      () => [good.response.status, good.response.body],
+      async (apiBaseUrl, requests) => {
+        for (const appSecret of [undefined, null, ""]) {
+          const { client, failures } = selfServeClient(vectors, apiBaseUrl, { appSecret });
+          await assert.rejects(client.activateOffline(vectors.config.licenseKey, { path: target }), {
+            message: "appSecret is required for online APIs; omit it only when using loginFromFile",
+          });
+          assert.equal(client.isAuthenticated(), false);
+          assert.deepEqual(failures, []);
+        }
+        assert.equal(requests.length, 0);
+        assert.deepEqual(await listDir(dir), []);
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("self-serve activation validates its arguments before any request", async () => {
+  const vectors = await readSelfServeVectors();
+  const { client } = selfServeClient(vectors, "http://127.0.0.1:9");
+  client._postJson = async () => {
+    throw new Error("must not post");
+  };
+  await assert.rejects(client.activateOffline(""), { message: "licenseKey must be a non-empty string" });
+  await assert.rejects(client.activateOffline("KEY", { path: "" }), {
+    message: "path must be a non-empty string when set",
+  });
+  await assert.rejects(client.activateOffline("KEY", { path: 42 }), {
+    message: "path must be a non-empty string when set",
+  });
+
+  // Fail-fast order (same in every SDK): empty license key, then missing app secret.
+  const { client: noSecret } = selfServeClient(vectors, "http://127.0.0.1:9", { appSecret: "" });
+  noSecret._postJson = client._postJson;
+  await assert.rejects(noSecret.activateOffline(""), { message: "licenseKey must be a non-empty string" });
+  await assert.rejects(noSecret.activateOffline("KEY", { path: "" }), {
+    message: "appSecret is required for online APIs; omit it only when using loginFromFile",
+  });
+});
+
+test("self-serve activation sends the same HWID as login() (machine fingerprint, no override)", async () => {
+  const vectors = await readSelfServeVectors();
+  const client = new AuthForgeClient({
+    appId: vectors.config.appId,
+    appSecret: vectors.config.appSecret,
+    publicKey: vectors.config.publicKey,
+    onFailure: () => {},
+  });
+  const posts = [];
+  client._postJson = async (p, body) => {
+    posts.push([p, { ...body }]);
+    return { status: "failed", error: "invalid_key" };
+  };
+  assert.equal(await client.login(vectors.config.licenseKey), false);
+  await assert.rejects(client.activateOffline(vectors.config.licenseKey), { code: "invalid_key" });
+  assert.deepEqual(
+    posts.map(([p]) => p),
+    ["/auth/validate", "/auth/offline/activate"],
+  );
+  assert.equal(posts[1][1].hwid, posts[0][1].hwid);
+  assert.equal(posts[1][1].hwid, client.getHwid());
+  assert.equal(posts[1][1].hwid, client._getHwid());
+  assert.notEqual(posts[1][1].nonce, posts[0][1].nonce);
+});
+
+test("self-serve activation network failure rejects and never exits, even without onFailure", async (t) => {
+  const exit = t.mock.method(process, "exit", () => {});
+  const vectors = await readSelfServeVectors();
+  // Closed port: connection refused on both attempts.
+  const { client, sleeps } = selfServeClient(vectors, "http://127.0.0.1:9", { onFailure: null });
+  await assert.rejects(client.activateOffline(vectors.config.licenseKey), (error) => {
+    assert.ok(error instanceof AuthForgeError);
+    assert.equal(error.code, "network_error");
+    assert.equal(error.transient, true);
+    return true;
+  });
+  assert.deepEqual(sleeps, [2], "one network retry, as login() does");
+  assert.equal(exit.mock.calls.length, 0);
+  assert.equal(client.isAuthenticated(), false);
+});
+
+test("self-serve activation maps non-JSON bodies to the existing transient codes", async () => {
+  const vectors = await readSelfServeVectors();
+  for (const [status, body, code] of [
+    [502, "<html>bad gateway</html>", "http_error_502"],
+    [200, "not json", "invalid_json_response"],
+    [200, "[]", "response_not_json_object"],
+  ]) {
+    await withRecordingServer(
+      () => [status, body],
+      async (apiBaseUrl) => {
+        const { client } = selfServeClient(vectors, apiBaseUrl);
+        await assert.rejects(client.activateOffline(vectors.config.licenseKey), (error) => {
+          assert.ok(error instanceof AuthForgeError, String(error));
+          assert.equal(error.code, code);
+          assert.equal(error.transient, true);
+          return true;
+        });
+        assert.equal(client.isAuthenticated(), false);
+      },
+    );
+  }
+});
+
+test("self-serve activation write failure leaves no file and no session", async () => {
+  const vectors = await readSelfServeVectors();
+  const good = vectors.cases.find((c) => c.name === "activated_new_machine");
+  const dir = await mkdtemp(path.join(os.tmpdir(), "authforge-activate-"));
+  // A regular file where the parent directory should be, so mkdir fails.
+  const blocker = path.join(dir, "not-a-dir");
+  await writeFile(blocker, "x", "utf8");
+  try {
+    await withRecordingServer(
+      () => [good.response.status, good.response.body],
+      async (apiBaseUrl) => {
+        const { client, failures } = selfServeClient(vectors, apiBaseUrl);
+        await assert.rejects(
+          client.activateOffline(vectors.config.licenseKey, { path: path.join(blocker, "license.authforge") }),
+          (error) => {
+            assert.ok(error instanceof AuthForgeError);
+            assert.equal(error.code, "file_write_failed");
+            assert.equal(error.transient, true);
+            return true;
+          },
+        );
+        assert.equal(client.isAuthenticated(), false);
+        assert.deepEqual(failures, []);
+        assert.deepEqual(await listDir(dir), ["not-a-dir"]);
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("self-serve activation codes are known and fatal", () => {
+  for (const code of [
+    "offline_activation_disabled",
+    "offline_activation_requires_perpetual",
+    "offline_activation_requires_seats",
+    "offline_activation_limit_reached",
+    "offline_file_rejected",
+  ]) {
+    assert.ok(knownServerErrors.includes(code), code);
+    assert.ok(definitiveErrorCodes.includes(code), code);
+    assert.equal(new AuthForgeError(code).fatal, true, code);
   }
 });

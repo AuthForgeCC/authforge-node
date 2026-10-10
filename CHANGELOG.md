@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.0
+
+### Features
+
+- **Self-serve offline activation.** New `activateOffline(licenseKey, { path })` -> `Promise<boolean>`: one call to `POST /auth/offline/activate` turns a license key into a lifetime `.authforge` file bound to this machine's HWID (the same HWID `login()` sends). The file is verified locally (signature against the configured public key(s), app id, HWID) before anything is written; with `path` it is written atomically (temp file + rename, parent directories created). On success the client holds an offline session exactly as after `loginFromFile()`, with no background checks. Needs the app secret, unlike air-gapped files. 2 credits per new machine, charged to the app owner; re-activating the same machine is free and returns the identical file. A refund or revoke cannot reach files already issued.
+- Failures reject with an `AuthForgeError` and never call `onFailure` or `process.exit`; nothing is written to `path` and the client does not become authenticated (an existing session is left as it was, as with `loginFromFile()`). Retries match `login()` (`rate_limited`, one network retry).
+- **New codes**, all fatal and in `knownServerErrors` / `definitiveErrorCodes`: `offline_activation_disabled`, `offline_activation_requires_perpetual`, `offline_activation_requires_seats`, `offline_activation_limit_reached` (from the server) and `offline_file_rejected` (SDK: the returned file failed local verification; the verifier's reason is in the message). The server's `hwid_mismatch` keeps meaning "no free seat". New transient SDK code `file_write_failed` when the verified file cannot be saved. A success response without `file` is `unexpected_response` (transient).
+- `authforge.d.ts`: `activateOffline`, `ActivateOfflineOptions`, `OfflineActivationErrorCode`.
+- Tests run every case in the shared `self_serve_activation_vectors.json`.
+
 ## 1.4.1
 
 ### Fixes

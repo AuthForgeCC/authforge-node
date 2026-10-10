@@ -1,8 +1,10 @@
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
+import { mkdir, open, rename, rm } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import os from "node:os";
+import { basename, dirname, join } from "node:path";
 import { clearInterval as clearIntervalTimer, setInterval as setIntervalTimer } from "node:timers";
 
 const DEFAULT_API_BASE_URL = "https://auth.authforge.cc";
@@ -26,6 +28,13 @@ const KNOWN_SERVER_ERRORS = new Set([
   "malformed_request",
   "demo_quota_exceeded",
   "system_error",
+  // Self-serve offline activation (`/auth/offline/activate`).
+  "offline_activation_disabled",
+  "offline_activation_requires_perpetual",
+  "offline_activation_requires_seats",
+  "offline_activation_limit_reached",
+  // SDK code: the activation response's file failed local verification.
+  "offline_file_rejected",
 ]);
 
 // The only codes that are a definitive verdict on the session or license.
@@ -40,6 +49,11 @@ const DEFINITIVE_ERROR_CODES = new Set([
   "app_disabled",
   "invalid_app",
   "signature_mismatch",
+  "offline_activation_disabled",
+  "offline_activation_requires_perpetual",
+  "offline_activation_requires_seats",
+  "offline_activation_limit_reached",
+  "offline_file_rejected",
 ]);
 
 // Documentation only: named codes known to be transient. Classification is
@@ -64,6 +78,7 @@ const TRANSIENT_ERROR_CODES = new Set([
   "revoke_requires_session",
   "missing_session_token",
   "nonce_mismatch",
+  "file_write_failed",
   "unknown_error",
 ]);
 const SERVER_ERROR_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
@@ -220,7 +235,7 @@ const ACTIVATION_REQUEST_VERSION = 1;
 const ACTIVATION_REQUEST_TYP = "authforge-activation-request";
 const BEGIN_ACTIVATION_REQUEST = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----";
 const END_ACTIVATION_REQUEST = "-----END AUTHFORGE ACTIVATION REQUEST-----";
-const SDK_TAG = "node/1.4.1";
+const SDK_TAG = "node/1.5.0";
 const MAX_REQUEST_HWID = 256;
 const MAX_REQUEST_MACHINE_NAME = 128;
 const MAX_REQUEST_OS = 64;
@@ -477,6 +492,33 @@ export function verifyLicenseFile({ file, appId, publicKey, hwid = null, now = u
     payloadBase64: parsed.payloadBase64,
     signatureBase64: parsed.signatureBase64,
   };
+}
+
+/**
+ * Write `text` to `filePath` atomically: a temp file in the same directory is
+ * written, flushed and renamed over the target, so readers see either the old
+ * file or the complete new one. Parent directories are created. On failure
+ * the temp file is removed and `filePath` is left as it was.
+ */
+async function writeFileAtomic(filePath, text) {
+  const dir = dirname(filePath);
+  await mkdir(dir, { recursive: true });
+  const tmpPath = join(dir, `.${basename(filePath)}.${randomBytes(6).toString("hex")}.tmp`);
+  let handle = null;
+  try {
+    handle = await open(tmpPath, "wx");
+    await handle.writeFile(Buffer.from(text, "utf8"));
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await rename(tmpPath, filePath);
+  } catch (error) {
+    if (handle !== null) {
+      await handle.close().catch(() => {});
+    }
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function postJson(urlText, body, timeoutSeconds) {
@@ -739,6 +781,90 @@ export class AuthForgeClient {
     return this._offlineLicense ? { ...this._offlineLicense } : null;
   }
 
+  /**
+   * Self-serve offline activation: turn a license key into a lifetime,
+   * HWID-bound `.authforge` file with one online call
+   * (`POST /auth/offline/activate`), then run from that file.
+   *
+   * Unlike air-gapped files this needs the app secret. A new machine costs
+   * the app owner 2 credits; the same machine activating again gets the
+   * identical file back for free (`replay`).
+   *
+   * The returned file is verified locally (signature, app id, this HWID)
+   * BEFORE anything is written. With `path`, it is then written atomically
+   * (parent directories created). On success the client holds an offline
+   * session exactly as after `loginFromFile()`: no heartbeat, no grace timer.
+   *
+   * Resolves `true`. On failure it rejects with an `AuthForgeError`
+   * (`offline_activation_limit_reached`, `hwid_mismatch`, `invalid_key`,
+   * `offline_file_rejected`, ...), never calls `onFailure` or
+   * `process.exit`, writes nothing and leaves the session as it was.
+   *
+   * @param {string} licenseKey
+   * @param {{ path?: string | null }} [options]
+   */
+  async activateOffline(licenseKey, options = {}) {
+    if (!licenseKey || typeof licenseKey !== "string") {
+      throw new Error("licenseKey must be a non-empty string");
+    }
+    this._requireAppSecret();
+    const filePath = options?.path ?? null;
+    if (filePath !== null && (typeof filePath !== "string" || filePath.length === 0)) {
+      throw new Error("path must be a non-empty string when set");
+    }
+
+    const body = {
+      appId: this.appId,
+      appSecret: this.appSecret,
+      licenseKey,
+      hwid: this._hwid,
+      nonce: this._generateNonce(),
+    };
+    let responseObject;
+    try {
+      // Same retries as login(); skipFailureHook so a network failure throws
+      // instead of reaching onFailure / process.exit.
+      responseObject = await this._postJson("/auth/offline/activate", body, { skipFailureHook: true });
+    } catch (error) {
+      throw this._toAuthForgeError(error);
+    }
+    if (!this._isSuccessStatus(responseObject?.status)) {
+      throw new AuthForgeError(this._extractServerError(responseObject));
+    }
+    const file = responseObject.file;
+    if (typeof file !== "string" || file.length === 0) {
+      throw new AuthForgeError("unexpected_response", "unexpected_response: success without a file");
+    }
+
+    // The server's hwid_mismatch means "no free seat"; a file this machine
+    // cannot use is a different failure, so the verifier's reason goes in
+    // the message and never becomes the code.
+    const result = verifyLicenseFile({
+      file,
+      appId: this.appId,
+      publicKey: this.publicKeys,
+      hwid: this._hwid,
+    });
+    if (!result.ok) {
+      throw new AuthForgeError("offline_file_rejected", `offline_file_rejected: ${result.error}`);
+    }
+
+    if (filePath !== null) {
+      try {
+        await writeFileAtomic(filePath, file);
+      } catch (error) {
+        // Transient: activating this machine again returns the same file free.
+        throw new AuthForgeError(
+          "file_write_failed",
+          `file_write_failed: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      }
+    }
+    this._applyOfflineLicense(result);
+    return true;
+  }
+
   _readLicenseFileInput(pathOrText) {
     if (typeof pathOrText !== "string" || pathOrText.length === 0) {
       throw new Error("license file must be a path or the armored text");
@@ -982,17 +1108,19 @@ export class AuthForgeClient {
     this._fail("heartbeat_failed", failure);
   }
 
-  _heartbeatError(error) {
-    let failure;
+  _toAuthForgeError(error) {
     if (error instanceof AuthForgeError) {
-      failure = error;
-    } else {
-      const message = error instanceof Error ? error.message : String(error);
-      const code = message.split(":", 1)[0].trim().toLowerCase();
-      failure = new AuthForgeError(SERVER_ERROR_CODE_RE.test(code) ? code : "unknown_error", message, {
-        cause: error,
-      });
+      return error;
     }
+    const message = error instanceof Error ? error.message : String(error);
+    const code = message.split(":", 1)[0].trim().toLowerCase();
+    return new AuthForgeError(SERVER_ERROR_CODE_RE.test(code) ? code : "unknown_error", message, {
+      cause: error,
+    });
+  }
+
+  _heartbeatError(error) {
+    const failure = this._toAuthForgeError(error);
     // A transient failure can't extend the session past its signed TTL.
     if (failure.transient && this._localSessionExpired()) {
       return new AuthForgeError("session_expired", "session_expired", { cause: failure });

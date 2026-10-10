@@ -16,11 +16,14 @@ If the license is revoked or expired, the background check fails and you handle 
 
 There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `loginFromFile()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (omit `appSecret`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login()` + grace period. To collect the HWID for a bound file, write an **activation request** (`.authforge-request`) with `createActivationRequest` / `writeActivationRequest`. It is not a license, is not signed, and does not mint anything. Prefer it over printing the raw HWID.
 
+A third, also **separate** mode is **self-serve offline activation** (`activateOffline()`), for apps sold as a one-time purchase: on first run the end user enters their key, one online call (`POST /auth/offline/activate`) returns a lifetime `.authforge` file bound to that machine, and from then on the app runs from the file with `loginFromFile()` and no network. Unlike air-gapped files it **needs the App Secret** in the build (it is an online call); air-gapped builds still ship with no app secret. The app owner must opt in on the app, and only perpetual, seat-limited licenses qualify. Only use it when the user asks for one-time-purchase / activate-once offline licensing.
+
 ## Billing model (so you can pick sensible intervals)
 
 - **1 `login()` or `validateLicense()` = 1 credit** (one `/auth/validate` debit).
 - **10 online check-ins = 1 credit** (billed on every 10th successful check-in per license). The grace period costs nothing after the initial activate.
 - **1 offline file mint = 1 credit** (charged to the operator when the file is minted). `loginFromFile()` / `verifyLicenseFile()` cost nothing.
+- **1 new offline activation = 2 credits; re-activating the same machine is free** (`activateOffline()`, charged to the app owner; a refused activation costs nothing).
 - Keep `heartbeatInterval` at `>= 10` seconds (`900` / 15 min is the common desktop default). `/auth/heartbeat` is limited to 6 requests/minute per license key, and revocations still take effect on the **next** check-in.
 
 ## Installation
@@ -98,7 +101,7 @@ This default configuration activates online once and then runs through the grace
 | Parameter | Type | Required | Default | Description |
 | --------- | ---- | -------- | ------- | ----------- |
 | `appId` | `string` | yes | - | Application ID |
-| `appSecret` | `string` | for online APIs | - | Application secret. Required for `login` / `validateLicense` / `selfBan`. Omit or pass `""` for `loginFromFile` only; do not ship it in air-gapped binaries. |
+| `appSecret` | `string` | for online APIs | - | Application secret. Required for `login` / `validateLicense` / `selfBan` / `activateOffline`. Omit or pass `""` for `loginFromFile` only; do not ship it in air-gapped binaries. |
 | `publicKey` | `string \| readonly string[]` | yes | - | Base64 Ed25519 public key from the dashboard (3rd positional arg, or `publicKey` in the options object). Accepts one key, an array, or a comma-separated string; the SDK trusts a signature matching **any** entry (key rotation) |
 | `onlineHeartbeat` | `boolean` | no | `false` | Enable online check-ins (periodic `/auth/heartbeat`). When `false`, the app runs through the grace period without contacting AuthForge |
 | `heartbeatMode` | `string` | no | - | **Deprecated.** `"SERVER"` or `"LOCAL"` (case-insensitive); still the 4th positional arg for compatibility. See [Migrating from heartbeatMode](#migrating-from-heartbeatmode) |
@@ -135,6 +138,7 @@ The client exposes `onlineHeartbeat` (boolean, the effective policy) and keeps a
 | `login(licenseKey)` | `Promise<boolean>` | Activates online: validates license, verifies signatures, starts the background check interval |
 | `validateLicense(licenseKey)` | `Promise<ValidateLicenseResult>` | Same validate + signatures as login; does not mutate session or start background checks; **never** calls `onFailure` or `process.exit`: use the result object |
 | `loginFromFile(pathOrText)` | `boolean` | Offline mode: verifies a `.authforge` file locally (no network), authenticates the client, never starts background checks. Failures -> `onFailure("offline_login_failed", error)` + `false`; never `process.exit` |
+| `activateOffline(licenseKey, { path }?)` | `Promise<boolean>` | Self-serve offline activation: one `POST /auth/offline/activate` returns a lifetime file bound to this HWID; verified locally, written atomically to `path`, then an offline session starts (as `loginFromFile`). Needs the app secret. Failures reject with `AuthForgeError`; never `onFailure` / `process.exit` |
 | `verifyLicenseFile(pathOrText, options?)` | `VerifyLicenseFileResult` | Same offline checks without changing client state |
 | `getOfflineLicense()` | `OfflineLicenseSummary \| null` | `jti`, `expiresAt`, `hwidPolicy`, … of the offline file in use |
 | `getSessionKind()` | `"online" \| "offline" \| null` | Kind of session the client holds; `null` when logged out |
@@ -149,7 +153,7 @@ The client exposes `onlineHeartbeat` (boolean, the effective policy) and keeps a
 
 ## Error codes the server can return
 
-Full set (`knownServerErrors`): invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, app_burn_cap_reached, blocked, rate_limited, replay_detected, app_disabled, session_expired, revoke_requires_session, bad_request, malformed_request, demo_quota_exceeded, system_error. Unrecognized codes are passed through verbatim.
+Full set (`knownServerErrors`): invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, app_burn_cap_reached, blocked, rate_limited, replay_detected, app_disabled, session_expired, revoke_requires_session, bad_request, malformed_request, demo_quota_exceeded, system_error, offline_activation_disabled, offline_activation_requires_perpetual, offline_activation_requires_seats, offline_activation_limit_reached, offline_file_rejected (SDK code). Unrecognized codes are passed through verbatim.
 
 Notes:
 - `replay_detected` is validate-only. `rate_limited` can be returned by `/auth/validate` and `/auth/heartbeat` (heartbeat is license-limited at 6/min and has no app-layer IP limit).
@@ -158,7 +162,7 @@ Notes:
 - `session_expired` is also raised locally when the grace period (session TTL) runs out.
 
 Heartbeat failure classification (`AuthForgeError.transient` / `isTransientError()`):
-- **Definitive** (allowlist, exported as `definitiveErrorCodes`): `revoked`, `expired`, `hwid_mismatch`, `blocked`, `session_expired`, `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch`. The SDK clears the stored session and stops check-ins before calling `onFailure`.
+- **Definitive** (allowlist, exported as `definitiveErrorCodes`): `revoked`, `expired`, `hwid_mismatch`, `blocked`, `session_expired`, `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch`, plus the self-serve activation codes `offline_activation_disabled`, `offline_activation_requires_perpetual`, `offline_activation_requires_seats`, `offline_activation_limit_reached`, `offline_file_rejected`. The SDK clears the stored session and stops check-ins before calling `onFailure`.
 - **Transient**: everything else, including `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, `unexpected_response`, every `http_error_<status>` and unknown codes. The session is kept and the SDK checks in again next interval; after the session TTL passes, the next transient failure becomes a definitive `session_expired`.
 - A failed check-in is a verdict only when its body is `{"status":"failed","error":"<code>"}`; any other failure body is `unexpected_response` (raw `status`/`error` in the message).
 - Only `rate_limited` (or a 429 with no error code) is retried inside the request (2s, then 5s). `no_credits`, `demo_quota_exceeded` and `app_burn_cap_reached` are never retried immediately.
@@ -198,6 +202,45 @@ if (!client.loginFromFile("./license.authforge")) {
 
 Offline file error codes (in check order): `bad_armor`, `bad_signature`, `unsupported_version`, `malformed_payload`, `wrong_app`, `expired`, `hwid_mismatch`.
 
+### Self-serve offline activation (one-time purchase, only when asked)
+
+Separate from the air-gapped flow above: this build **ships the App Secret** (activation is an online call), the app owner has enabled self-serve offline activation on the app, and the licenses are perpetual and seat-limited. 1 new offline activation = 2 credits (charged to the app owner); re-activating the same machine is free and returns the identical file.
+
+```js
+import { existsSync } from "node:fs";
+import { AuthForgeClient, AuthForgeError } from "@authforgecc/sdk";
+
+const LICENSE_PATH = "./license.authforge"; // a writable per-user location
+
+const client = new AuthForgeClient({
+  appId: "YOUR_APP_ID",
+  appSecret: process.env.AUTHFORGE_APP_SECRET, // required for activateOffline()
+  publicKey: "YOUR_PUBLIC_KEY",
+  onFailure: () => {}, // loginFromFile() reports here; activateOffline() throws instead
+});
+
+if (!(existsSync(LICENSE_PATH) && client.loginFromFile(LICENSE_PATH))) {
+  const key = await promptForKey(); // app UI
+  try {
+    await client.activateOffline(key, { path: LICENSE_PATH }); // verifies, then writes atomically
+  } catch (error) {
+    if (!(error instanceof AuthForgeError)) throw error;
+    if (error.code === "offline_activation_limit_reached") {
+      showError("This key is activated on its maximum number of computers. Please contact the vendor.");
+    } else if (error.code === "invalid_key") {
+      showError("That license key is not valid."); // classified transient, but a retry needs a different key
+    } else if (error.transient) {
+      showError("Activation failed, please try again later."); // network, rate_limited, no_credits, ...
+    } else {
+      showError(`Activation refused: ${error.code}`); // revoked, hwid_mismatch (no free seat), ...
+    }
+  }
+}
+// On success: getSessionKind() === "offline", no background checks; next launch takes the loginFromFile() branch.
+```
+
+Codes (all fatal): `offline_activation_disabled` (app has not opted in), `offline_activation_requires_perpetual`, `offline_activation_requires_seats` (shared keys cannot self-serve), `offline_activation_limit_reached` (every machine slot used; HWID resets do not free them; tell the user to contact the vendor), `offline_file_rejected` (SDK code: the returned file failed local verification and was not written; the verifier's reason is in `error.message`). The server's `hwid_mismatch` here means no free seat. `file_write_failed` (transient) means the verified file could not be saved; activating again is free. Existing codes keep their meaning and classification.
+
 ### Custom error handling
 
 Server error codes appear as `AuthForgeError` in the `error` passed to `onFailure`: `error.code` is the code (for example `invalid_key`, `revoked`, `hwid_mismatch`), `error.message` the message. Reasons are `login_failed`, `heartbeat_failed`, `network_error` (login only), or `offline_login_failed`. For `heartbeat_failed`, `error` is always an `AuthForgeError`; use `error.transient` to tolerate outages.
@@ -234,6 +277,9 @@ const onFailure = (reason, error) => {
 - Do not treat the grace period as persistent offline licensing - it is session continuation after one successful online activation, and revocations are only picked up at the next online validate or check-in
 - Do not reach for `loginFromFile()` unless the user explicitly needs air-gapped / offline-file licensing - the default is online `login()` + grace period
 - Do not expect an online revoke to disable an offline file that is already on a customer machine - the file stays valid until its own `expiresAt`; prefer short expiries and HWID-bound files
+- Do not use `activateOffline()` for air-gapped builds or confuse it with them - it needs the App Secret and one online call; air-gapped builds use operator-minted files and ship no secret. Files from `activateOffline()` are lifetime: a refund, chargeback or revoke cannot reach them
+- Do not call `activateOffline()` on every launch - try `loginFromFile(path)` first and activate only when there is no file or it fails; each new machine costs 2 credits (same machine is free)
+- Do not treat the server's `hwid_mismatch` from `activateOffline()` as a local file problem - it means no free seat; a file that fails local checks is `offline_file_rejected`
 - Do not mint or accept `hwid.mode: "any"` files casually - anyone who copies an unbound file has a working license
 - Do not call `loginFromFile()` with another app's public key or app id - the file is rejected with `bad_signature` / `wrong_app` by design
 - Do not try to build `.authforge` files client-side - only the AuthForge cloud holds the signing key; there is no BYO issuer
